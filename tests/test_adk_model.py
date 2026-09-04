@@ -1,0 +1,321 @@
+"""ADK <-> NVIDIA translation: contents, tools, schemas, responses."""
+
+from __future__ import annotations
+
+import pytest
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.registry import LLMRegistry
+from google.genai import types
+
+from app.llm.adk_model import (
+    KimiK3Llm,
+    _contents_to_messages,
+    _normalize_schema,
+    _response_format,
+    _schema_to_json,
+    _system_text,
+    _tools_to_openai,
+)
+from app.llm.nvidia_kimi import Completion, ToolCall
+
+
+# ------------------------------------------------------------------- registry
+
+
+def test_kimi_is_resolvable_by_model_string():
+    assert LLMRegistry.resolve("moonshotai/kimi-k3") is KimiK3Llm
+
+
+def test_default_model_is_kimi_k3():
+    assert KimiK3Llm().model == "moonshotai/kimi-k3"
+
+
+# --------------------------------------------------------------------- schema
+
+
+def test_genai_schema_types_are_lowercased():
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={"path": types.Schema(type=types.Type.STRING)},
+        required=["path"],
+    )
+    result = _schema_to_json(schema)
+    assert result["type"] == "object"
+    assert result["properties"]["path"]["type"] == "string"
+    assert result["required"] == ["path"]
+
+
+def test_nested_array_schema_is_normalized():
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "files": types.Schema(
+                type=types.Type.ARRAY, items=types.Schema(type=types.Type.STRING)
+            )
+        },
+    )
+    files = _schema_to_json(schema)["properties"]["files"]
+    assert files["type"] == "array"
+    assert files["items"]["type"] == "string"
+
+
+def test_none_schema_becomes_empty_object():
+    assert _schema_to_json(None) == {"type": "object", "properties": {}}
+
+
+def test_ref_and_defs_are_renamed_to_json_schema_spelling():
+    normalized = _normalize_schema({"defs": {"A": {"type": "STRING"}}, "ref": "#/defs/A"})
+    assert "$defs" in normalized
+    assert normalized["$ref"] == "#/defs/A"
+    assert normalized["$defs"]["A"]["type"] == "string"
+
+
+# ---------------------------------------------------------------------- tools
+
+
+def test_function_declarations_become_openai_tools():
+    config = types.GenerateContentConfig(
+        tools=[
+            types.Tool(
+                function_declarations=[
+                    types.FunctionDeclaration(
+                        name="read_file",
+                        description="Read a file",
+                        parameters=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={"path": types.Schema(type=types.Type.STRING)},
+                        ),
+                    )
+                ]
+            )
+        ]
+    )
+    tools = _tools_to_openai(config)
+    assert len(tools) == 1
+    assert tools[0]["type"] == "function"
+    assert tools[0]["function"]["name"] == "read_file"
+    assert tools[0]["function"]["parameters"]["properties"]["path"]["type"] == "string"
+
+
+def test_no_tools_yields_empty_list():
+    assert _tools_to_openai(types.GenerateContentConfig()) == []
+
+
+# ----------------------------------------------------------- system + contents
+
+
+def test_system_instruction_accepts_plain_string():
+    config = types.GenerateContentConfig(system_instruction="Be terse.")
+    assert _system_text(config) == "Be terse."
+
+
+def test_system_instruction_accepts_content():
+    config = types.GenerateContentConfig(
+        system_instruction=types.Content(parts=[types.Part(text="Be terse.")])
+    )
+    assert _system_text(config) == "Be terse."
+
+
+def test_user_and_model_turns_map_to_openai_roles():
+    contents = [
+        types.Content(role="user", parts=[types.Part(text="hi")]),
+        types.Content(role="model", parts=[types.Part(text="hello")]),
+    ]
+    assert _contents_to_messages(contents) == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+
+def test_function_call_becomes_assistant_tool_calls():
+    contents = [
+        types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(
+                        id="c1", name="read_file", args={"path": "a.py"}
+                    )
+                )
+            ],
+        )
+    ]
+    message = _contents_to_messages(contents)[0]
+    assert message["role"] == "assistant"
+    assert message["tool_calls"][0]["id"] == "c1"
+    assert message["tool_calls"][0]["function"]["name"] == "read_file"
+    assert '"path"' in message["tool_calls"][0]["function"]["arguments"]
+
+
+def test_function_response_becomes_tool_message():
+    contents = [
+        types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id="c1", name="read_file", response={"content": "x = 1"}
+                    )
+                )
+            ],
+        )
+    ]
+    messages = _contents_to_messages(contents)
+    assert messages == [
+        {"role": "tool", "tool_call_id": "c1", "content": '{"content": "x = 1"}'}
+    ]
+
+
+def test_tool_call_and_result_round_trip_preserves_ids():
+    contents = [
+        types.Content(role="user", parts=[types.Part(text="read it")]),
+        types.Content(
+            role="model",
+            parts=[
+                types.Part(
+                    function_call=types.FunctionCall(id="c9", name="f", args={})
+                )
+            ],
+        ),
+        types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id="c9", name="f", response={"ok": True}
+                    )
+                )
+            ],
+        ),
+    ]
+    messages = _contents_to_messages(contents)
+    assert messages[1]["tool_calls"][0]["id"] == "c9"
+    assert messages[2]["tool_call_id"] == "c9"
+
+
+def test_thought_parts_are_never_sent_back():
+    contents = [
+        types.Content(
+            role="model",
+            parts=[
+                types.Part(text="secret reasoning", thought=True),
+                types.Part(text="visible answer"),
+            ],
+        )
+    ]
+    messages = _contents_to_messages(contents)
+    assert messages[0]["content"] == "visible answer"
+    assert "secret reasoning" not in messages[0]["content"]
+
+
+# ------------------------------------------------------------ structured output
+
+
+def test_response_schema_becomes_json_schema_format():
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=types.Schema(
+            type=types.Type.OBJECT,
+            properties={"summary": types.Schema(type=types.Type.STRING)},
+        ),
+    )
+    fmt = _response_format(config)
+    assert fmt["type"] == "json_schema"
+    assert fmt["json_schema"]["schema"]["properties"]["summary"]["type"] == "string"
+
+
+def test_json_mime_without_schema_uses_json_object():
+    config = types.GenerateContentConfig(response_mime_type="application/json")
+    assert _response_format(config) == {"type": "json_object"}
+
+
+def test_plain_text_needs_no_response_format():
+    assert _response_format(types.GenerateContentConfig()) is None
+
+
+# ------------------------------------------------------------- request build
+
+
+def test_empty_conversation_gets_a_user_turn():
+    """NIM rejects a request whose only message is a system prompt."""
+    request = LlmRequest(
+        contents=[],
+        config=types.GenerateContentConfig(system_instruction="Do the thing."),
+    )
+    messages = KimiK3Llm()._build_call(request)["messages"]
+    assert messages[0]["role"] == "system"
+    assert any(m["role"] == "user" for m in messages)
+
+
+def test_generation_settings_are_forwarded():
+    request = LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part(text="hi")])],
+        config=types.GenerateContentConfig(
+            temperature=0.2, max_output_tokens=512, seed=7
+        ),
+    )
+    call = KimiK3Llm()._build_call(request)
+    assert call["temperature"] == 0.2
+    assert call["max_tokens"] == 512
+    assert call["seed"] == 7
+
+
+# ---------------------------------------------------------------- responses
+
+
+@pytest.mark.asyncio
+async def test_text_completion_becomes_llm_response(monkeypatch):
+    model = KimiK3Llm()
+
+    async def fake(**kwargs):
+        return Completion(text="done", finish_reason="stop")
+
+    monkeypatch.setattr(type(model._client), "acomplete", staticmethod(fake))
+    request = LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part(text="go")])],
+        config=types.GenerateContentConfig(),
+    )
+    responses = [r async for r in model.generate_content_async(request)]
+    assert len(responses) == 1
+    assert responses[0].content.parts[0].text == "done"
+    assert responses[0].content.role == "model"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_completion_becomes_function_call_part(monkeypatch):
+    model = KimiK3Llm()
+
+    async def fake(**kwargs):
+        return Completion(
+            tool_calls=[ToolCall(id="c1", name="run_tests", arguments={"path": "tests"})],
+            finish_reason="tool_calls",
+        )
+
+    monkeypatch.setattr(type(model._client), "acomplete", staticmethod(fake))
+    request = LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part(text="test it")])],
+        config=types.GenerateContentConfig(),
+    )
+    responses = [r async for r in model.generate_content_async(request)]
+    call = responses[0].content.parts[0].function_call
+    assert call.name == "run_tests"
+    assert call.args == {"path": "tests"}
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_becomes_error_response(monkeypatch):
+    from app.llm.nvidia_kimi import NVIDIAAuthError
+
+    model = KimiK3Llm()
+
+    async def fake(**kwargs):
+        raise NVIDIAAuthError("bad key")
+
+    monkeypatch.setattr(type(model._client), "acomplete", staticmethod(fake))
+    request = LlmRequest(
+        contents=[types.Content(role="user", parts=[types.Part(text="go")])],
+        config=types.GenerateContentConfig(),
+    )
+    responses = [r async for r in model.generate_content_async(request)]
+    assert responses[0].error_code == "NVIDIAAuthError"
+    assert "bad key" in responses[0].error_message

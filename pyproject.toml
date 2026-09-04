@@ -1,0 +1,42 @@
+[project]
+name = "se-agent"
+version = "0.1.0"
+description = "Multi-agent software engineering assistant on Google ADK 2.8.0 and NVIDIA Kimi K3"
+requires-python = ">=3.11"
+dependencies = [
+    "google-adk==2.8.0",
+    "pydantic>=2.7",
+    "requests>=2.31",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: hits the live NVIDIA NIM API (deselect with '-m \"not integration\"')",
+    "docker: requires a working Docker daemon",
+]
+filterwarnings = ["ignore::UserWarning"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
