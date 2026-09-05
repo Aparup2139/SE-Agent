@@ -1,5 +1,6 @@
 """NVIDIA NIM / Kimi K3 provider layer -- the only LLM backend in SE-Agent."""
 
+from .adk_model import KimiK3Llm
 from .config import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
@@ -7,10 +8,8 @@ from .config import (
     NVIDIAConfig,
     get_config,
 )
-from .adk_model import KimiK3Llm
 from .nvidia_kimi import (
     Completion,
-    ToolCall,
     NVIDIAAuthError,
     NVIDIAError,
     NVIDIAKimiClient,
@@ -18,6 +17,7 @@ from .nvidia_kimi import (
     NVIDIAResponseError,
     NVIDIAServerError,
     NVIDIATimeoutError,
+    ToolCall,
     get_client,
 )
 

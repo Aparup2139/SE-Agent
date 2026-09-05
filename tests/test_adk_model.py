@@ -18,7 +18,6 @@ from app.llm.adk_model import (
 )
 from app.llm.nvidia_kimi import Completion, ToolCall
 
-
 # ------------------------------------------------------------------- registry
 
 
