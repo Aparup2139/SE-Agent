@@ -232,7 +232,17 @@ class DockerSandbox:
         )
 
     def run_tests(self, command: str = "pytest -q", timeout: int | None = None) -> TestReport:
-        """Run the project's test suite and parse the real result.
+        """Run the project's test suite and parse the real result."""
+        return self.run_tests_with_output(command, timeout=timeout)[0]
+
+    def run_tests_with_output(
+        self, command: str = "pytest -q", timeout: int | None = None
+    ) -> tuple[TestReport, str]:
+        """Run the tests, returning the parsed report *and* the raw output.
+
+        The raw output is returned separately so the caller can store it as an
+        artifact instead of inlining a multi-thousand-line log into session
+        state.
 
         The returned :class:`TestReport` is derived entirely from the process
         exit code and output. Nothing here is ever authored by a model.
@@ -240,11 +250,14 @@ class DockerSandbox:
         result = self.run(command, timeout=timeout)
 
         if result.sandbox_error:
-            return TestReport(
-                command=command,
-                exit_code=result.exit_code,
-                execution_error=result.sandbox_error,
-                duration_seconds=round(result.duration_seconds, 2),
+            return (
+                TestReport(
+                    command=command,
+                    exit_code=result.exit_code,
+                    execution_error=result.sandbox_error,
+                    duration_seconds=round(result.duration_seconds, 2),
+                ),
+                result.combined_output,
             )
 
         report = parse_pytest_output(result.combined_output)
@@ -260,7 +273,7 @@ class DockerSandbox:
                 "the test command failed before any test ran: "
                 f"{result.combined_output.strip()[:400]}"
             )
-        return report
+        return report, result.combined_output
 
 
 # --------------------------------------------------------------- output parsing

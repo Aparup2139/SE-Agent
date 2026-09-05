@@ -412,13 +412,14 @@ def test_sandbox_failure_summary_does_not_claim_a_test_result():
 class FakeSandbox:
     """Stands in for Docker so the tester's state contract can be exercised."""
 
-    def __init__(self, report: TestReport):
+    def __init__(self, report: TestReport, output: str = "raw pytest output"):
         self.report = report
+        self.output = output
         self.commands: list[str] = []
 
-    def run_tests(self, command, timeout=None):
+    def run_tests_with_output(self, command, timeout=None):
         self.commands.append(command)
-        return self.report
+        return self.report, self.output
 
 
 async def _run_tester(report: TestReport, initial: dict | None = None):
@@ -476,3 +477,35 @@ async def test_tester_uses_the_repository_test_command():
         {"repository": {"test_command": "go test ./..."}},
     )
     assert sandbox.commands == ["go test ./..."]
+
+
+@pytest.mark.asyncio
+async def test_full_test_log_goes_to_an_artifact_not_into_state():
+    """A failing suite's log is thousands of lines; state must not carry it."""
+    huge = "FAILED test_x\n" * 5000
+    tester = TesterAgent()
+    tester.sandbox = FakeSandbox(
+        TestReport(passed=1, failed=1, test_count=2, exit_code=1), output=huge
+    )
+
+    runner = InMemoryRunner(agent=tester, app_name="artifact_test")
+    session = await runner.session_service.create_session(
+        app_name="artifact_test", user_id="u"
+    )
+    message = types.Content(role="user", parts=[types.Part(text="run")])
+    async for _ in runner.run_async(
+        user_id="u", session_id=session.id, new_message=message
+    ):
+        pass
+
+    refreshed = await runner.session_service.get_session(
+        app_name="artifact_test", user_id="u", session_id=session.id
+    )
+    tests = refreshed.state["tests"]
+    assert tests["output_artifact"], "the log should be stored as an artifact"
+    assert huge not in str(refreshed.state), "the raw log must not enter state"
+
+    saved = await runner.artifact_service.list_artifact_keys(
+        app_name="artifact_test", user_id="u", session_id=session.id
+    )
+    assert tests["output_artifact"] in saved

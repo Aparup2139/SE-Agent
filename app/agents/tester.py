@@ -88,6 +88,32 @@ class TesterAgent(BaseAgent):
     def _sandbox(self) -> DockerSandbox:
         return self.sandbox or get_sandbox()
 
+    async def _save_log(self, ctx: InvocationContext, log: str) -> str:
+        """Store the full test output as an artifact, not in session state.
+
+        A failing suite's output runs to thousands of lines. Session state is
+        copied into every downstream prompt, so the log goes to the artifact
+        service and only its name is kept in the report.
+        """
+        service = getattr(ctx, "artifact_service", None)
+        if service is None or not log.strip():
+            return ""
+
+        iteration = ctx.session.state.get("iteration", 0)
+        filename = f"test_output_iteration_{iteration}.txt"
+        try:
+            await service.save_artifact(
+                app_name=ctx.session.app_name,
+                user_id=ctx.session.user_id,
+                session_id=ctx.session.id,
+                filename=filename,
+                artifact=types.Part(text=log),
+            )
+        except Exception as exc:  # noqa: BLE001 - losing a log must not fail the run
+            logger.warning("could not save test output artifact: %s", exc)
+            return ""
+        return filename
+
     async def _run_async_impl(
         self, ctx: InvocationContext
     ) -> AsyncGenerator[Event, None]:
@@ -95,7 +121,8 @@ class TesterAgent(BaseAgent):
         command = _resolve_command(state)
 
         logger.info("running tests: %s", command)
-        report = self._sandbox().run_tests(command)
+        report, raw_output = self._sandbox().run_tests_with_output(command)
+        report.output_artifact = await self._save_log(ctx, raw_output)
 
         summary = _summarize(report)
         if report.execution_error:
