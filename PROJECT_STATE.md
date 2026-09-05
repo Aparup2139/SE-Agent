@@ -51,12 +51,20 @@ done.
 
 ## Tests / status
 
-`pytest -q` -> **225 passed, 1 skipped** (symlink test needs Windows
+`pytest -q` -> **249 passed, 1 skipped** (symlink test needs Windows
 privileges). Lint clean.
 
-Verified live: NIM chat completion, NIM function calling, a full ADK agent loop,
-Docker sandbox execution, that `NVIDIA_API_KEY` does not reach the sandbox, and
-structured output round-tripping through `set_model_response`.
+Verified live against the provider: NIM chat completion, NIM function calling, a
+full ADK agent loop, Docker sandbox execution, that `NVIDIA_API_KEY` does not
+reach the sandbox, structured output round-tripping through
+`set_model_response`, and the tester catching a deliberately introduced bug
+with the exact failing assertion.
+
+Verified without the provider: `tests/test_graph_integration.py` runs the whole
+graph -- real Runner, real routing, real tester -- against a stub model, so
+every branch (green/approved, retry-to-exhaustion, no-diff, sandbox failure,
+minor -> coder, major -> architect, budget accounting) is pinned regardless of
+quota.
 
 ## Operational notes
 
