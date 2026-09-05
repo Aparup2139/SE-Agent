@@ -88,6 +88,23 @@ Free NIM tiers are also aggressively rate-limited; the client backs off on 429
 for up to a minute per attempt, and a run that exhausts its retries reports the
 failure rather than pretending to have succeeded.
 
+### Running the HTTP server
+
+```bash
+uvicorn app.server:app
+```
+
+`GET /` serves a small console; `POST /api/run` streams a run as server-sent
+events. Because a run **writes files and executes code**, two controls bound it:
+
+| Variable | Effect |
+| --- | --- |
+| `SE_AGENT_API_TOKEN` | Bearer token required on every run. Unset, the server refuses any caller that is not on loopback. |
+| `SE_AGENT_REPO_ROOT` | The only directory tree a request may target. Unset, the `repo` field is refused and runs use the server's own directory. |
+
+Neither default is open: an unconfigured server works locally and is inert to
+anyone else. Do not expose it without setting a token.
+
 ---
 
 ## How it works

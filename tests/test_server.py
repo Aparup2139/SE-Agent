@@ -98,7 +98,7 @@ def test_updates_and_result_are_streamed(client, monkeypatch):
     tracker = RunTracker()
     tracker.tool_calls = 4
 
-    async def fake_stream(request, repo=None, limit=None):
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
         yield Update(kind="tool", text="read_file(path=a.py)", phase=Phase.ANALYSIS)
         yield Update(kind="tests", text="6 passed, 0 failed", phase=Phase.TESTING)
@@ -125,7 +125,7 @@ def test_updates_and_result_are_streamed(client, monkeypatch):
 def test_a_failed_run_is_reported_as_not_succeeded(client, monkeypatch):
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None):
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
         yield RunResult(
             session_id="run-x",
             state={"tests_passed": True, "review_approved": False},
@@ -142,7 +142,7 @@ def test_a_failed_run_is_reported_as_not_succeeded(client, monkeypatch):
 def test_a_crash_mid_stream_becomes_an_error_event(client, monkeypatch):
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None):
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
         raise RuntimeError("provider exploded")
 
@@ -150,3 +150,93 @@ def test_a_crash_mid_stream_becomes_an_error_event(client, monkeypatch):
     events = parse_sse(client.post("/api/run", json={"request": "x"}).text)
     assert events[-1][0] == "error"
     assert "provider exploded" in events[-1][1]["text"]
+
+
+# ------------------------------------------------------------------- security
+
+
+def test_a_token_free_server_serves_loopback(client, monkeypatch):
+    """Local development stays frictionless."""
+    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
+    monkeypatch.setattr(server, "preflight", lambda repo=None: [])
+
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
+        yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
+
+    monkeypatch.setattr(server, "stream_run", fake_stream)
+    assert client.post("/api/run", json={"request": "x"}).status_code == 200
+
+
+def test_a_wrong_token_is_rejected(client, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
+    response = client.post(
+        "/api/run",
+        json={"request": "x"},
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert response.status_code == 401
+
+
+def test_a_missing_token_is_rejected_when_one_is_configured(client, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
+    assert client.post("/api/run", json={"request": "x"}).status_code == 401
+
+
+def test_the_right_token_is_accepted(client, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
+    monkeypatch.setattr(server, "preflight", lambda repo=None: [])
+
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
+        yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
+
+    monkeypatch.setattr(server, "stream_run", fake_stream)
+    response = client.post(
+        "/api/run",
+        json={"request": "x"},
+        headers={"Authorization": "Bearer correct-token"},
+    )
+    assert response.status_code == 200
+
+
+def test_choosing_a_repo_is_refused_without_a_configured_root(client, monkeypatch):
+    """An HTTP caller must not pick an arbitrary host path for a writing agent."""
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
+    response = client.post("/api/run", json={"request": "x", "repo": "C:/Windows"})
+    assert response.status_code == 403
+    assert "SE_AGENT_REPO_ROOT" in response.json()["detail"]
+
+
+def test_a_repo_inside_the_root_is_allowed(tmp_path, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_REPO_ROOT", str(tmp_path))
+    (tmp_path / "project").mkdir()
+    resolved = server.resolve_repo("project")
+    assert resolved == str((tmp_path / "project").resolve())
+
+
+def test_a_repo_outside_the_root_is_refused(tmp_path, monkeypatch):
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("SE_AGENT_REPO_ROOT", str(tmp_path / "allowed"))
+    (tmp_path / "allowed").mkdir()
+    (tmp_path / "secret").mkdir()
+    with _pytest.raises(HTTPException) as exc:
+        server.resolve_repo(str(tmp_path / "secret"))
+    assert exc.value.status_code == 403
+
+
+def test_traversal_out_of_the_root_is_refused(tmp_path, monkeypatch):
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("SE_AGENT_REPO_ROOT", str(tmp_path / "allowed"))
+    (tmp_path / "allowed").mkdir()
+    with _pytest.raises(HTTPException) as exc:
+        server.resolve_repo("../../etc")
+    assert exc.value.status_code == 403
+
+
+def test_no_repo_means_the_servers_own_directory(monkeypatch):
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    assert server.resolve_repo(None) is None
