@@ -101,6 +101,21 @@ def read_review(state) -> CodeReview | None:
         return None
 
 
+def _changed_files() -> list[str]:
+    """Files modified in the target repository, via git.
+
+    Returns an empty list when the repository is clean *or* when git cannot
+    answer. A tool failure must not be mistaken for evidence of a change.
+    """
+    from ..tools.repo_tools import git_status
+
+    result = git_status()
+    if not result.get("ok"):
+        logger.warning("could not read git status: %s", result.get("error"))
+        return []
+    return [change["path"] for change in result.get("changes", [])]
+
+
 # ------------------------------------------------------------- routing nodes
 
 
@@ -133,10 +148,29 @@ async def decide_after_tests(ctx: Context) -> str:
     ``tests_passed`` is written by the tester from a process exit code. It is
     the only thing consulted here -- no model gets a say in whether the tests
     passed.
+
+    A green suite is necessary but not sufficient. If the working tree is
+    unchanged, the suite that passed is the one that was already passing before
+    the run started, which says nothing about the requested feature. That
+    happens whenever the implementation step fails -- a provider error, an
+    exhausted rate limit -- and without this check an untouched repository would
+    sail through to review on the strength of its pre-existing tests.
     """
     if ctx.state.get("tests_passed"):
+        changed = _changed_files()
+        if not changed:
+            ctx.route = ROUTE_FAILED
+            return (
+                "Tests passed, but the working tree is unchanged -- nothing was "
+                "implemented, so these are the pre-existing tests. Treating this "
+                "as a failed iteration."
+            )
+        ctx.state["files_changed"] = changed
         ctx.route = ROUTE_PASSED
-        return "Tests passed; sending the change for independent review."
+        return (
+            f"Tests passed across {len(changed)} changed file(s); sending the "
+            "change for independent review."
+        )
 
     tests = ctx.state.get("tests") or {}
     if tests.get("execution_error"):

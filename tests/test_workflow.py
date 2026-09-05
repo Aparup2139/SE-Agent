@@ -15,6 +15,7 @@ from app.schemas import (
     Severity,
     TestReport,
 )
+from app.workflows import graph
 from app.workflows.graph import (
     DEFAULT_MAX_ITERATIONS,
     ITERATION_CEILING,
@@ -180,11 +181,56 @@ async def test_iteration_gate_allows_exactly_the_budgeted_attempts():
 # ------------------------------------------------------------------ test gate
 
 
+@pytest.fixture
+def with_changes(monkeypatch):
+    """Pretend the working tree has been modified."""
+    monkeypatch.setattr(graph, "_changed_files", lambda: ["textstats/stats.py"])
+
+
+@pytest.fixture
+def without_changes(monkeypatch):
+    monkeypatch.setattr(graph, "_changed_files", lambda: [])
+
+
 @pytest.mark.asyncio
-async def test_test_gate_routes_a_pass_to_review():
+async def test_test_gate_routes_a_pass_to_review(with_changes):
     ctx = FakeContext({"tests_passed": True})
     await decide_after_tests(ctx)
     assert ctx.route == ROUTE_PASSED
+    assert ctx.state["files_changed"] == ["textstats/stats.py"]
+
+
+@pytest.mark.asyncio
+async def test_green_tests_with_no_diff_are_not_a_pass(without_changes):
+    """The pre-existing suite passing proves nothing was implemented."""
+    ctx = FakeContext({"tests_passed": True})
+    message = await decide_after_tests(ctx)
+    assert ctx.route == ROUTE_FAILED
+    assert "unchanged" in message
+
+
+@pytest.mark.asyncio
+async def test_unreadable_git_status_is_not_treated_as_a_change(monkeypatch):
+    """A git failure must not be mistaken for evidence of an implementation."""
+    from app.tools import repo_tools
+
+    monkeypatch.setattr(
+        repo_tools, "git_status", lambda: {"ok": False, "error": "not a git repository"}
+    )
+    ctx = FakeContext({"tests_passed": True})
+    await decide_after_tests(ctx)
+    assert ctx.route == ROUTE_FAILED
+
+
+def test_changed_files_reports_modified_paths(monkeypatch):
+    from app.tools import repo_tools
+
+    monkeypatch.setattr(
+        repo_tools,
+        "git_status",
+        lambda: {"ok": True, "changes": [{"status": "M", "path": "a.py"}]},
+    )
+    assert graph._changed_files() == ["a.py"]
 
 
 @pytest.mark.asyncio

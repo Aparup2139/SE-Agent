@@ -46,3 +46,89 @@ Append-only. Newest last.
 ### Result
 
 Phase 1 complete. Foundation verified live, not just typechecked.
+
+## Phase 2 -- schemas, tools, agents, workflow
+
+**Goal:** everything between a feature request and a reviewed change.
+
+### What was built
+
+- `app/schemas/workflow.py` -- the typed contract between stages, with enforced
+  length and count limits. Two properties carry the weight: `TestReport.is_green`
+  (false unless tests actually ran and all passed) and `CodeReview.routing_scope`
+  (derived from the findings, so routing follows the review's content).
+- `app/tools/` -- `workspace.py` holds the safety primitives every tool goes
+  through; `repo_tools.py` the read/search/git/edit tools; `sandbox.py` the
+  Docker executor and the pytest output parser.
+- `app/agents/` -- ten agents. Nine are Kimi K3 with role-specific prompts; the
+  tester has no model at all.
+- `app/workflows/graph.py` -- the graph.
+
+### Notes worth remembering
+
+- **ADK 2.8.0 deprecates `SequentialAgent`, `ParallelAgent` and `LoopAgent`** in
+  favour of `Workflow`. The deprecation warning surfaced during testing. Since
+  `Workflow` is also the API that provides explicit routing and real cycles --
+  exactly what this design needs -- the workflow was rebuilt on it.
+- Before committing to `Workflow`, a throwaway probe confirmed that `ctx.state`,
+  `ctx.route` and **back-edges (cycles)** all work as hoped.
+- **ADK allows an agent instance exactly one parent.** The first assembly failed
+  with `architecture_agent already has a parent agent`. Agents became factories.
+- ADK reconciles `output_schema` with `tools` itself, via an injected
+  `set_model_response` tool, so an agent can have both.
+- The sandbox image must be built before tests can run; `preflight()` says so.
+
+### Result
+
+182 tests passing, including live Docker isolation checks.
+
+## Phase 3 -- entry point, telemetry, compaction, evaluation
+
+### What was built
+
+- `app/agent.py` (runner, services, preflight, CLI), `app/telemetry.py`
+  (events -> phase checklist), context compaction, `evaluation/`.
+
+### Two bugs the first live run found
+
+1. **`output_schema` arrives as a class, not an instance.** ADK passes
+   `LlmAgent(output_schema=Requirements)` through as the Pydantic *class*, so
+   `_schema_to_json` called an unbound `model_dump` and the first node died with
+   `BaseModel.model_dump() missing 1 required positional argument: 'self'`.
+   It now handles all four shapes ADK produces.
+2. **Timeout and retry budget were both too small.** 120s is not enough for
+   `reasoning_effort=max`, and three quick retries cannot outlast a rate-limit
+   window. Now 300s and 5 retries, with 429 on its own slower schedule
+   (5s/10s/20s/40s/60s) since NIM does not reliably send `Retry-After`.
+
+### The end-to-end run
+
+The full workflow ran against `evaluation/fixtures/textstats`. The NVIDIA
+account was rate-limited throughout, so **every model call returned HTTP 429**
+and no code was written. What that run still proves is worth recording:
+
+- All eight phases were traversed in the correct order.
+- Routing worked: implement -> test -> review -> back to implement, then the
+  iteration budget was spent and the graph terminated at the report.
+- The iteration ceiling held: `--max-iterations 2` produced exactly two
+  implementation attempts before routing to `exhausted`.
+- **The tester ran twice against real Docker and reported 6 passed** -- it needs
+  no model, which is exactly why it was built that way.
+- The run exited 1 and produced no report. It did not claim success.
+
+### The gap that run exposed
+
+The tester reported a green suite while the coder had never run, and the graph
+routed that to review. A green suite with an unchanged working tree is the
+pre-existing suite, and proves nothing about the requested feature.
+`decide_after_tests` now requires a non-empty diff before treating a pass as a
+pass, and a git failure counts as "no evidence of change" rather than evidence.
+
+### Still outstanding
+
+A full successful run needs NIM quota. The system is verified at every level
+that does not depend on it.
+
+### Result
+
+212 tests passing.

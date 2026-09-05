@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 # problems -- retrying them just burns time and rate-limit budget.
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
+# Rate limits need a slower schedule than ordinary transient errors: a NIM
+# throttling window outlasts a 1s/2s/4s backoff, so those retries would be spent
+# for nothing. 5s/10s/20s/40s/60s gives the window a chance to reset.
+RATE_LIMIT_BASE_DELAY = 5.0
+RATE_LIMIT_MAX_DELAY = 60.0
+
 
 class NVIDIAError(RuntimeError):
     """Base class for every NVIDIA backend failure."""
@@ -97,8 +103,16 @@ def _backoff(attempt: int) -> float:
     return min(2.0**attempt, 30.0) + random.uniform(0, 0.5)
 
 
-def _retry_after_seconds(headers: Any, attempt: int) -> float:
-    """Honour a server-provided Retry-After, else exponential backoff+jitter."""
+def _retry_after_seconds(
+    headers: Any, attempt: int, status: int | None = None
+) -> float:
+    """Honour a server-provided Retry-After, else back off exponentially.
+
+    NIM does not always send Retry-After with a 429, and the ordinary backoff
+    (about 1s, 2s, 4s) is far too quick to outlast a rate-limit window -- it
+    just spends the retry budget and fails. Rate limits therefore get their own,
+    much longer schedule.
+    """
     try:
         raw = headers.get("Retry-After")
     except AttributeError:  # pragma: no cover - defensive
@@ -108,6 +122,10 @@ def _retry_after_seconds(headers: Any, attempt: int) -> float:
             return min(float(raw), 60.0)
         except (TypeError, ValueError):
             pass
+    if status == 429:
+        return min(RATE_LIMIT_BASE_DELAY * (2**attempt), RATE_LIMIT_MAX_DELAY) + (
+            random.uniform(0, 1.0)
+        )
     return _backoff(attempt)
 
 
@@ -317,7 +335,9 @@ class NVIDIAKimiClient:
                     last_error = exc
 
                 if attempt < self.config.max_retries:
-                    delay = _retry_after_seconds(response.headers, attempt)
+                    delay = _retry_after_seconds(
+                        response.headers, attempt, response.status_code
+                    )
                     logger.warning(
                         "NVIDIA HTTP %s; retrying in %.1fs (attempt %d/%d)",
                         response.status_code,
@@ -495,7 +515,9 @@ class NVIDIAKimiClient:
                         last_error = exc
 
                     if attempt < self.config.max_retries:
-                        delay = _retry_after_seconds(response.headers, attempt)
+                        delay = _retry_after_seconds(
+                        response.headers, attempt, response.status_code
+                    )
                         logger.warning(
                             "NVIDIA HTTP %s; retrying in %.1fs (attempt %d/%d)",
                             response.status_code,

@@ -284,3 +284,43 @@ def test_sse_deltas_are_concatenated(client):
 def test_malformed_sse_lines_are_skipped(client):
     lines = ["data: {broken", 'data: {"choices":[{"delta":{"content":"ok"}}]}']
     assert "".join(client._iter_sse_text(iter(lines))) == "ok"
+
+
+# ------------------------------------------------------- rate-limit backoff
+
+
+def test_rate_limits_back_off_far_slower_than_other_errors():
+    """A NIM throttling window outlasts a 1s/2s/4s schedule."""
+    from app.llm.nvidia_kimi import _retry_after_seconds
+
+    for attempt in range(3):
+        rate_limited = _retry_after_seconds({}, attempt, 429)
+        transient = _retry_after_seconds({}, attempt, 503)
+        assert rate_limited > transient, f"attempt {attempt}"
+
+
+def test_rate_limit_backoff_grows_and_is_capped():
+    from app.llm.nvidia_kimi import RATE_LIMIT_MAX_DELAY, _retry_after_seconds
+
+    delays = [_retry_after_seconds({}, a, 429) for a in range(8)]
+    assert delays[0] >= 5.0
+    assert delays[1] > delays[0]
+    assert all(d <= RATE_LIMIT_MAX_DELAY + 1.0 for d in delays)
+
+
+def test_server_retry_after_header_wins_over_backoff():
+    from app.llm.nvidia_kimi import _retry_after_seconds
+
+    assert _retry_after_seconds({"Retry-After": "7"}, 5, 429) == 7.0
+
+
+def test_absurd_retry_after_is_capped():
+    from app.llm.nvidia_kimi import _retry_after_seconds
+
+    assert _retry_after_seconds({"Retry-After": "99999"}, 0, 429) == 60.0
+
+
+def test_unparseable_retry_after_falls_back_to_backoff():
+    from app.llm.nvidia_kimi import _retry_after_seconds
+
+    assert _retry_after_seconds({"Retry-After": "soon"}, 0, 429) >= 5.0
