@@ -75,6 +75,19 @@ python -m app.agent --repo ../my-project --max-iterations 3 \
 (default 5, hard ceiling 10). SE-Agent checks its prerequisites before starting
 and reports every problem at once rather than failing on the first.
 
+### A note on runtime
+
+Kimi K3 is a reasoning model and the default `reasoning_effort` is `max`, which
+is slow: measured on a trivial prompt, a single model turn takes roughly 111s at
+`max` and 58s at `low` (those are the only two values Kimi K3 accepts -- not
+`medium`). A full run is twenty or more turns once tool calls are counted, so
+expect it to take a while.
+
+Set `NVIDIA_REASONING_EFFORT=low` in `.env` for a substantially faster run.
+Free NIM tiers are also aggressively rate-limited; the client backs off on 429
+for up to a minute per attempt, and a run that exhausts its retries reports the
+failure rather than pretending to have succeeded.
+
 ---
 
 ## How it works

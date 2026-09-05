@@ -207,8 +207,13 @@ async def run_baseline(task: Task, workspace: Path) -> TaskResult:
             for part in getattr(event.content, "parts", None) or []:
                 if getattr(part, "function_call", None):
                     tool_calls += 1
-                    if part.function_call.name == "run_tests":
-                        result.tests_passed = True  # provisional; verified below
+                # The baseline has no tester agent, so the only honest signal is
+                # what run_tests actually returned. Calling it proves nothing.
+                response = getattr(part, "function_response", None)
+                if response is not None and response.name == "run_tests":
+                    payload = response.response
+                    if isinstance(payload, dict):
+                        result.tests_passed = bool(payload.get("ok"))
             if event.error_message:
                 result.errors.append(f"{event.error_code}: {event.error_message}")
     except Exception as exc:  # noqa: BLE001

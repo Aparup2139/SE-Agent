@@ -1,4 +1,11 @@
-"""Coder: implement the plan against the real repository."""
+"""Coder: implement the plan against the real repository.
+
+The workflow graph wires in the *coordinator* rather than this agent: it has the
+same authority and instructions plus the ability to consult specialists, so
+running both would just be an extra hop. This one is kept as the plain
+implementation agent for a graph that wants no delegation -- the evaluation
+baseline builds its own, and a caller can use this directly.
+"""
 
 from __future__ import annotations
 
