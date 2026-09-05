@@ -21,6 +21,10 @@ done.
 - `app/tools/`: path-confined repository tools; secrets and binaries refused.
 - `app/tools/sandbox.py` + `sandbox/Dockerfile`: Docker execution with no
   network, read-only root, dropped capabilities, allowlisted environment.
+- `sandbox/local.sh` + `ScriptSandbox`: a second backend (`SE_AGENT_SANDBOX=script`)
+  that needs no container. Applies a network namespace and process ceiling on
+  Linux/WSL, and only a clean environment on Windows -- where it is explicitly
+  not a security boundary. Both backends share one test parser.
 - `app/agents/`: ten agents, all Kimi K3 except the model-free tester.
 - `app/workflows/graph.py`: ADK 2.8.0 `Workflow` graph with explicit routing.
 
@@ -48,10 +52,14 @@ done.
 7. **Compaction runs on Kimi K3** -- the summarizer would otherwise default to
    its own model.
 8. **Test logs go to artifacts**, not session state.
+9. **Exit 97 means the sandbox failed**, never that tests failed -- otherwise a
+   broken sandbox reads as a red suite and the debugger chases a phantom bug.
+10. **The script backend reports what it actually isolates** through
+    `preflight()`, so nothing claims containment it does not have.
 
 ## Tests / status
 
-`pytest -q` -> **249 passed, 1 skipped** (symlink test needs Windows
+`pytest -q` -> **272 passed, 1 skipped** (symlink test needs Windows
 privileges). Lint clean.
 
 Verified live against the provider: NIM chat completion, NIM function calling, a

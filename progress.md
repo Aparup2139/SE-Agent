@@ -194,3 +194,46 @@ every model call failed.
 
 Re-run `python -m app.agent --repo ... "<request>"` when quota allows, and
 `python -m evaluation.run_eval --baseline` for the measured comparison.
+
+## Sandbox backends
+
+Docker is no longer the only way to execute repository code. `SE_AGENT_SANDBOX`
+now selects between the container backend and `sandbox/local.sh`, a shell
+script that applies whatever isolation the host OS actually offers.
+
+The script was chosen over a second Python backend because it keeps every
+OS-specific decision in ~130 readable lines, and because the contract it
+satisfies -- `script <session-id> <timeout> <command>`, exit 97 for
+infrastructure failure -- makes a future backend (OpenShell, bubblewrap, a VM)
+a new script rather than new Python.
+
+### What it isolates, honestly
+
+| Platform | Applied |
+| --- | --- |
+| Everywhere | `env -i` allowlist, workspace as cwd, private HOME/TMPDIR, file-size ceiling |
+| Linux / WSL | additionally `unshare -rn` network namespace, process ceiling |
+| Windows | nothing further -- **not a security boundary** |
+
+`preflight()` reports the probe verbatim, so the GUI health line states what is
+actually in force rather than implying containment.
+
+### Verified
+
+- The project's own suite runs green through the script backend (6 passed on
+  the textstats fixture).
+- An off-by-one introduced into `word_count` is caught with the exact
+  assertion: `FAILED test_word_count_counts_words - AssertionError: assert 5 == 4`.
+- `NVIDIA_API_KEY`, `SE_AGENT_API_TOKEN` and `AWS_SECRET_ACCESS_KEY` are absent
+  from the command's environment; only 16 allowlisted variables are present.
+- A broken sandbox reports `execution_error` with zero failures, so it cannot
+  be mistaken for a red suite.
+
+### Two bugs found while building it
+
+1. The clean environment discards the active virtualenv, so the command got the
+   system Python without pytest. The script now prefers the workspace `.venv`,
+   overridable with `SE_AGENT_SANDBOX_PATH`.
+2. A Windows path contains a colon, which is also the `PATH` separator, so
+   prepending `C:/...` silently produced two nonexistent entries. Everything
+   bound for `PATH` now goes through `cygpath -u` first.

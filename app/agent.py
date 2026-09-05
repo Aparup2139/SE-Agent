@@ -32,7 +32,7 @@ from .llm.adk_model import KimiK3Llm
 from .llm.config import MissingAPIKeyError, get_config
 from .schemas import FinalReport
 from .telemetry import RunTracker, Update
-from .tools.sandbox import docker_available
+from .tools.sandbox import sandbox_available
 from .tools.workspace import get_workspace
 from .workflows.graph import build_workflow, initial_state, max_iterations
 
@@ -92,12 +92,15 @@ def preflight(repo: str | None = None) -> list[str]:
     except Exception as exc:  # noqa: BLE001 - surfaced to the user as text
         problems.append(f"workspace unusable: {exc}")
 
-    available, detail = docker_available()
+    # Whichever backend is selected must be able to run, or the tester cannot
+    # produce a real result -- and a run that cannot test is a run that cannot
+    # honestly report success.
+    available, detail = sandbox_available()
     if not available:
         problems.append(
-            f"Docker is required to run tests in isolation, but {detail}. "
-            "Start Docker Desktop, then build the sandbox image with: "
-            "docker build -t se-agent-sandbox:latest sandbox/"
+            f"the test sandbox is not usable: {detail}. Start Docker Desktop and "
+            "build the image (docker build -t se-agent-sandbox:latest sandbox/), "
+            "or set SE_AGENT_SANDBOX=script to use sandbox/local.sh instead."
         )
 
     return problems

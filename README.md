@@ -44,7 +44,8 @@ never surfaced in the UI.
 ## Requirements
 
 - Python 3.11+
-- Docker (running) -- used to execute repository code and tests
+- Docker (running) -- executes repository code and tests.
+  A script backend is available instead; see **Sandbox backends** below.
 - An NVIDIA NIM API key from <https://build.nvidia.com/>
 
 ## Setup
@@ -61,6 +62,44 @@ docker build -t se-agent-sandbox:latest sandbox/
 
 `.env` is gitignored. The key is never logged, never included in an exception
 message, and never passed into the sandbox.
+
+## Sandbox backends
+
+Repository code is never executed unguarded. Choose the backend with
+`SE_AGENT_SANDBOX`:
+
+| Value | Isolation |
+| --- | --- |
+| `docker` (default) | A real boundary: no network, read-only root, dropped capabilities, bounded CPU/memory/PIDs, environment allowlist. |
+| `script` | `sandbox/local.sh` -- a network namespace and process ceiling on Linux and WSL; on Windows only a clean environment and a working directory. |
+
+```bash
+SE_AGENT_SANDBOX=script python -m app.agent --repo . "add a word-count helper"
+```
+
+**On Windows the script backend is not a security boundary.** The agent's code
+runs as you, with your files and your network. It is appropriate for a
+repository you would have run `pytest` in anyway; it is not appropriate for an
+untrusted task. Read `sandbox/local.sh` -- it is short, and it states exactly
+what it applies on each platform. `preflight()` reports the same, so the
+server's health line never claims containment it does not have.
+
+What holds on every platform is the environment allowlist: the command starts
+from `env -i` and receives only what the script lists, so `NVIDIA_API_KEY` and
+every other host secret are absent rather than merely unmentioned.
+
+Because the clean environment also discards any active virtualenv, the script
+prefers the workspace's own `.venv`; `SE_AGENT_SANDBOX_PATH` overrides that
+with a directory to put first on `PATH`.
+
+The script's contract is deliberately small, so a different mechanism is a new
+script rather than new Python:
+
+```
+script <session-id> <timeout-seconds> <command>
+  exit  the command's own exit code
+  97    the sandbox itself failed -- never confused with a failing test suite
+```
 
 ## Usage
 
@@ -101,6 +140,7 @@ events. Because a run **writes files and executes code**, two controls bound it:
 | --- | --- |
 | `SE_AGENT_API_TOKEN` | Bearer token required on every run. Unset, the server refuses any caller that is not on loopback. |
 | `SE_AGENT_REPO_ROOT` | The only directory tree a request may target. Unset, the `repo` field is refused and runs use the server's own directory. |
+| `SE_AGENT_SANDBOX` | `docker` (default) or `script`. See **Sandbox backends**. |
 
 Neither default is open: an unconfigured server works locally and is inert to
 anyone else. Do not expose it without setting a token.
@@ -177,9 +217,10 @@ app/
 │   ├── config.py       settings and key hygiene
 │   ├── nvidia_kimi.py  HTTP client: retries, error taxonomy, streaming
 │   └── adk_model.py    KimiK3Llm(BaseLlm), registered with LLMRegistry
-├── tools/            repository tools and the Docker sandbox
+├── tools/            repository tools and the sandbox backends
 └── schemas/          the typed contract between stages
 sandbox/Dockerfile    the execution image
+sandbox/local.sh      the script backend
 evaluation/fixtures/  sample projects to run against
 ```
 

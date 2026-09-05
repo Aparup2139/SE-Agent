@@ -22,11 +22,15 @@ from .sandbox import (
     ExecutionResult,
     SandboxConfig,
     SandboxError,
+    ScriptConfig,
+    ScriptSandbox,
     docker_available,
     get_sandbox,
     parse_pytest_output,
+    reset_sandbox,
     run_command,
     run_tests,
+    sandbox_available,
 )
 from .workspace import Workspace, WorkspaceError, get_workspace
 
@@ -42,6 +46,8 @@ TESTING_TOOLS = [*READ_ONLY_TOOLS, *EXECUTION_TOOLS]
 __all__ = [
     "CODING_TOOLS",
     "DockerSandbox",
+    "ScriptConfig",
+    "ScriptSandbox",
     "EXECUTION_TOOLS",
     "ExecutionResult",
     "INSPECTION_TOOLS",
@@ -55,6 +61,8 @@ __all__ = [
     "docker_available",
     "edit_file",
     "get_sandbox",
+    "reset_sandbox",
+    "sandbox_available",
     "get_workspace",
     "git_diff",
     "git_log",

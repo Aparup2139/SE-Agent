@@ -1,0 +1,170 @@
+[33mcommit ae3a118c4642914cf18cccab779a2d5399fa2902[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:33:47 2026 +0530
+
+    Update status: 249 tests, graph verified without provider quota
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit 69e242d78916c74de0550b705d589c53a0aa7f68[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:33:34 2026 +0530
+
+    Execute the whole graph against a stub model
+    
+    The orchestration is the part that must be correct regardless of what any model
+    says, and until now it could only be verified against a live provider -- which
+    this account's rate limit made unreliable. These tests run the real Runner, the
+    real graph, the real routing nodes and the real tester agent, replacing only the
+    model and the sandbox. No network, no quota.
+    
+    Eleven paths are covered end to end, including the ones that matter most:
+    
+    - A green suite on a real diff reaches the report; the tester's numbers come
+      from the sandbox rather than from a model.
+    - Never-passing tests exhaust the budget instead of looping, and an exhausted
+      run still terminates at the report.
+    - A green suite with no diff never reaches the reviewer at all -- the regression
+      the previous commit fixed, now pinned at the graph level.
+    - A sandbox failure never reaches the reviewer.
+    - CHANGES_REQUIRED returns to the engineer; a major finding returns to the
+      architect.
+    - The iteration budget is spent exactly, verified by counting sandbox calls.
+    
+    Writing the stub surfaced two things worth recording in the test itself: ADK
+    asks for structured output two different ways depending on whether the agent
+    also holds tools, and it validates that output against the schema before it
+    reaches state -- so a nonsense verdict fails the node rather than becoming an
+    approval.
+    
+    249 tests pass.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit 7579dc818b26b135f6fd155e708f595afd162b04[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:29:17 2026 +0530
+
+    Remove the empty callbacks package
+    
+    Scaffolded from the initial layout and never used: the observability it was
+    meant to hold is in app/telemetry.py, which folds the ADK event stream into
+    phase progress. An empty package is more misleading than no package.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit 9be7262f80c8a7339b1d4d3c845937f95039372a[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:28:38 2026 +0530
+
+    Record what the live runs established, and what blocked them
+    
+    Two full end-to-end attempts were made against the fixture project. Both were
+    defeated by the NVIDIA account's rate limit rather than by the system: the
+    second got requirements and repository analysis through with real structured
+    output before the quota ran out.
+    
+    Worth recording because it is the point of the design: with every model call
+    failing, both runs still traversed all eight phases in order, honoured the
+    iteration ceiling exactly, ran the tester against real Docker, and exited
+    non-zero with no report rather than claiming success.
+    
+    Also records the provider-independent verification -- an off-by-one introduced
+    into the fixture was caught by the sandbox with the exact failing assertion,
+    which exercises the safety-critical path end to end.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit e1c903ba3fc362b1874737f2fd9ed442d422dc73[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:27:52 2026 +0530
+
+    Bound the HTTP server's authority: authentication and path confinement
+    
+    A security review of the previous commit was right: POST /api/run started an
+    agent that writes files and executes commands, took an arbitrary host path as
+    the target directory, and required no authentication. Exposed on any interface,
+    that is remote code execution.
+    
+    Two controls, neither of which defaults to open:
+    
+    - SE_AGENT_API_TOKEN, compared with hmac.compare_digest so the check cannot leak
+      a prefix by timing. With no token configured the server serves loopback only,
+      because starting it on 0.0.0.0 would otherwise silently hand code execution to
+      the network.
+    - SE_AGENT_REPO_ROOT confines the target directory. Paths are resolved before
+      the containment check, so traversal and symlinks both fail. Without the
+      variable the repo field is refused outright rather than defaulting to
+      anywhere on disk.
+    
+    Both are resolved before the stream opens, so a rejection is an ordinary
+    401/403 rather than an error buried inside a 200 body. The run is now attributed
+    to the caller's identity instead of a hardcoded user id.
+    
+    238 tests pass.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit c550a9e5556bf1dd6e65e55a14c169adb5b4355f[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:24:20 2026 +0530
+
+    Make workflow concurrency configurable for rate-limited providers
+    
+    The analysis stage fans out deliberately, which doubles the instantaneous
+    request rate. On the free NIM tier that turned out to be the difference between
+    a run progressing and a run spending its retry budget on 429s.
+    
+    SE_AGENT_MAX_CONCURRENCY=1 serializes the graph, trading the parallelism for a
+    halved request rate. The default is unchanged and still unbounded, because
+    parallel analysis is the right shape when quota allows.
+    
+    229 tests pass.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit 1723d9b310f091ea93c18d4491d6d93ee8ab35d6[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:21:47 2026 +0530
+
+    Add the FastAPI server and a minimal streaming console
+    
+    A run takes minutes, so the HTTP interface is a stream rather than a
+    request/response: POST /api/run returns server-sent events as each phase, tool
+    call, test result and review lands. It consumes the same stream_run the CLI
+    does, so there is one execution path and two renderings of it.
+    
+    GET /api/health runs the same preflight the CLI does, so a client can tell the
+    user what is missing before a run rather than after. GET / serves a single-file
+    console with the phase checklist and activity log, so the server is usable
+    without a build step.
+    
+    A preflight failure and a mid-stream crash both arrive as error events rather
+    than a broken connection or a 500 -- with a stream already open, an exception
+    would otherwise reach the client as a truncated body with no explanation.
+    
+    225 tests pass.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_015WekZfiyxkz7HhGis9KCTY
+
+[33mcommit f35721050f64093a284c1fd7fe5a7760027a046b[m
+Author: Aparup Ghosh <your_email@example.com>
+Date:   Sat Sep 5 11:18:39 2026 +0530
+
+    Store full test logs as artifacts instead of in session state
+    
+    TestReport carried an output_artifact field that nothing populated, and the
+    artifact service was wired but unused, so a failing suite's output had nowhere
+    to go but the summary. A failing run's log is thousands of lines and session
+    state is copied into every downstream prompt.
+    
+    The sandbox now exposes run_tests_with_output, returning the parsed report and
+    the raw output separately, and the tester saves the log through the artifact
+    service, keeping only its name in state. A failure to sa
