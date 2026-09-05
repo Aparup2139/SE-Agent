@@ -132,3 +132,65 @@ that does not depend on it.
 ### Result
 
 212 tests passing.
+
+## Phase 4 -- server, security, and what the live runs established
+
+### What was built
+
+- `app/server.py` -- FastAPI SSE stream over the same `stream_run` the CLI uses,
+  plus a single-file console so the server is usable without a build step.
+- `SE_AGENT_MAX_CONCURRENCY` -- an escape hatch for tight provider quotas. The
+  analysis fan-out doubles the instantaneous request rate, which on the free NIM
+  tier costs more in 429 retries than the parallelism saves.
+
+### Security review of the server commit
+
+An automated review flagged the first server commit, correctly. `POST /api/run`
+started an agent that writes files and runs commands, accepted an arbitrary host
+path as its target, and required no authentication. On any non-loopback
+interface that is remote code execution.
+
+Fixed with two controls, neither defaulting to open:
+
+- `SE_AGENT_API_TOKEN`, compared with `hmac.compare_digest`. With no token set,
+  only loopback callers are served -- binding to `0.0.0.0` must not silently
+  hand out code execution.
+- `SE_AGENT_REPO_ROOT` confines the target directory, resolving before the
+  containment check so traversal and symlinks both fail. Unset, the `repo` field
+  is refused rather than defaulting to anywhere on disk.
+
+### Verification that does not depend on the provider
+
+- **The tester detects a real bug.** An off-by-one was introduced into
+  `word_count` in a copy of the fixture; the sandbox reported `5 passed,
+  1 failed`, `is_green=False`, and the exact assertion
+  (`test_word_count_counts_words - AssertionError: assert 5 == 4`). This is the
+  safety-critical path, verified end to end against real Docker.
+- Structured output round-trips: the repository agent returned a populated
+  `RepositoryAnalysis` through ADK's `set_model_response` tool, so the
+  schema/tools path works against Kimi K3 through the adapter.
+- 238 tests pass; lint clean.
+
+### The blocker
+
+The NVIDIA account is rate-limited to the point where a full run cannot finish.
+Two complete attempts were made. The first (`reasoning_effort=max`) 429'd on
+every model call; the second (`low`) got Requirements and the repository
+analysis through -- both producing real, correct structured output -- before the
+quota was exhausted again.
+
+Measured latency, for planning purposes: a single model turn is ~111s at `max`
+and ~58s at `low`, and a full run is 20+ turns.
+
+### What the failed runs did prove
+
+Both runs traversed all eight phases in order, honoured the iteration ceiling
+exactly, ran the tester against real Docker, terminated at the report node, and
+**exited non-zero without producing a report** rather than claiming success.
+The failure mode this project was built to prevent did not occur even when
+every model call failed.
+
+### Next action
+
+Re-run `python -m app.agent --repo ... "<request>"` when quota allows, and
+`python -m evaluation.run_eval --baseline` for the measured comparison.
