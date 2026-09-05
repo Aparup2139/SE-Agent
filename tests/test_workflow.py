@@ -509,3 +509,30 @@ async def test_full_test_log_goes_to_an_artifact_not_into_state():
         app_name="artifact_test", user_id="u", session_id=session.id
     )
     assert tests["output_artifact"] in saved
+
+
+# ------------------------------------------------------------- concurrency
+
+
+def test_concurrency_is_unbounded_by_default(monkeypatch):
+    """Repository and risk analysis are meant to overlap."""
+    monkeypatch.delenv("SE_AGENT_MAX_CONCURRENCY", raising=False)
+    assert graph.max_concurrency() is None
+    assert build_workflow().max_concurrency is None
+
+
+def test_concurrency_can_be_serialized(monkeypatch):
+    """An escape hatch for tightly rate-limited providers."""
+    monkeypatch.setenv("SE_AGENT_MAX_CONCURRENCY", "1")
+    assert graph.max_concurrency() == 1
+    assert build_workflow().max_concurrency == 1
+
+
+def test_malformed_concurrency_falls_back_to_unbounded(monkeypatch):
+    monkeypatch.setenv("SE_AGENT_MAX_CONCURRENCY", "lots")
+    assert graph.max_concurrency() is None
+
+
+def test_zero_concurrency_is_raised_to_one(monkeypatch):
+    monkeypatch.setenv("SE_AGENT_MAX_CONCURRENCY", "0")
+    assert graph.max_concurrency() == 1

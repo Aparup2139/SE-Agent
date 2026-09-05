@@ -82,6 +82,24 @@ def max_iterations() -> int:
     return max(1, min(value, ITERATION_CEILING))
 
 
+def max_concurrency() -> int | None:
+    """How many nodes may run at once. ``None`` means unbounded.
+
+    The analysis stage fans out deliberately, which doubles the instantaneous
+    request rate. On a tightly rate-limited NIM tier that is the difference
+    between a run completing and a run spending its retry budget on 429s, so
+    setting ``SE_AGENT_MAX_CONCURRENCY=1`` serializes the graph at the cost of
+    the parallelism.
+    """
+    raw = os.environ.get("SE_AGENT_MAX_CONCURRENCY")
+    if not raw:
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
+
+
 def read_review(state) -> CodeReview | None:
     """Parse the reviewer's structured output, tolerating a malformed turn.
 
@@ -258,6 +276,7 @@ def build_workflow() -> Workflow:
 
     workflow = Workflow(
         name="se_agent",
+        max_concurrency=max_concurrency(),
         description=(
             "Takes a feature request through requirements, parallel repository "
             "and risk analysis, architecture, planning, implementation with "
