@@ -29,7 +29,7 @@ from pathlib import Path
 
 from app.agent import RunResult, stream_run
 from app.telemetry import Update
-from app.tools.sandbox import DockerSandbox
+from app.tools.sandbox import Sandbox
 from app.tools.workspace import Workspace
 
 from .tasks import Task, get_tasks
@@ -90,7 +90,7 @@ def verify(task: Task, workspace: Path) -> tuple[bool, str]:
     script = workspace / "_verify_task.py"
     try:
         script.write_text(task.verification, encoding="utf-8")
-        result = DockerSandbox(Workspace(workspace)).run(
+        result = Sandbox(Workspace(workspace)).run(
             "python _verify_task.py", timeout=120
         )
     except Exception as exc:  # noqa: BLE001 - a broken check is a failed check

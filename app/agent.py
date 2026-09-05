@@ -98,9 +98,7 @@ def preflight(repo: str | None = None) -> list[str]:
     available, detail = sandbox_available()
     if not available:
         problems.append(
-            f"the test sandbox is not usable: {detail}. Start Docker Desktop and "
-            "build the image (docker build -t se-agent-sandbox:latest sandbox/), "
-            "or set SE_AGENT_SANDBOX=script to use sandbox/local.sh instead."
+            f"the test sandbox is not usable: {detail}"
         )
 
     return problems

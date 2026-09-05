@@ -28,10 +28,12 @@ def test_health_reports_ready_when_preflight_is_clean(client, monkeypatch):
 
 
 def test_health_reports_problems(client, monkeypatch):
-    monkeypatch.setattr(server, "preflight", lambda repo=None: ["docker is not running"])
+    monkeypatch.setattr(
+        server, "preflight", lambda repo=None: ["no isolation boundary is available"]
+    )
     body = client.get("/api/health").json()
     assert body["ready"] is False
-    assert "docker is not running" in body["problems"]
+    assert "no isolation boundary is available" in body["problems"]
 
 
 # --------------------------------------------------------------------- phases

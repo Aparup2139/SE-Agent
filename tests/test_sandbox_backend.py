@@ -15,10 +15,9 @@ import pytest
 from app.tools import sandbox as sandbox_module
 from app.tools.sandbox import (
     SANDBOX_FAILED_EXIT,
-    DockerSandbox,
     ExecutionResult,
-    ScriptConfig,
-    ScriptSandbox,
+    Sandbox,
+    SandboxConfig,
     _base_env,
 )
 from app.tools.workspace import Workspace
@@ -28,14 +27,20 @@ needs_bash = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _accept_missing_boundary(monkeypatch):
+    """These tests exercise mechanics, not the policy gate."""
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+
+
 @pytest.fixture
 def box(tmp_path):
-    return ScriptSandbox(Workspace(tmp_path), session_id="test-session")
+    return Sandbox(Workspace(tmp_path), session_id="test-session")
 
 
 @pytest.fixture
 def ready_box(box, monkeypatch):
-    monkeypatch.setattr(ScriptSandbox, "preflight", lambda self: (True, "ok"))
+    monkeypatch.setattr(Sandbox, "preflight", lambda self: (True, "ok"))
     return box
 
 
@@ -142,30 +147,57 @@ def test_a_failed_sandbox_produces_no_test_failures(ready_box, monkeypatch):
 
 
 def test_a_missing_script_fails_preflight(tmp_path):
-    box = ScriptSandbox(Workspace(tmp_path), ScriptConfig(script="no/such.sh"))
+    box = Sandbox(Workspace(tmp_path), SandboxConfig(script="no/such.sh"))
     ok, detail = box.preflight()
     assert not ok
     assert "not found" in detail
 
 
-# ------------------------------------------------------------------ selection
+# ----------------------------------------------------------- the unsafe gate
 
 
-def test_the_backend_is_chosen_by_environment(monkeypatch):
-    monkeypatch.setenv("SE_AGENT_SANDBOX", "script")
+def test_a_run_refuses_to_start_with_no_boundary(box, monkeypatch):
+    """Unisolated execution must be chosen, never stumbled into."""
+    monkeypatch.delenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", raising=False)
+    monkeypatch.setattr(Sandbox, "tier", lambda self: "none")
+    monkeypatch.setattr(Sandbox, "_ask_script", lambda self, flag: "none: clean env")
+
+    ok, detail = box.preflight()
+    assert not ok
+    assert "no isolation boundary" in detail
+    assert "SE_AGENT_SANDBOX_ALLOW_UNSAFE" in detail
+
+
+def test_the_gate_can_be_opened_deliberately(box, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+    monkeypatch.setattr(Sandbox, "tier", lambda self: "none")
+    monkeypatch.setattr(Sandbox, "_ask_script", lambda self, flag: "none: clean env")
+
+    ok, detail = box.preflight()
+    assert ok
+    # ...but the result still says so, so no UI can imply containment.
+    assert "UNSAFE" in detail
+
+
+def test_a_real_tier_needs_no_gate(box, monkeypatch):
+    monkeypatch.delenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", raising=False)
+    monkeypatch.setattr(Sandbox, "tier", lambda self: "unshare")
+    monkeypatch.setattr(
+        Sandbox, "_ask_script", lambda self, flag: "unshare: network namespace"
+    )
+
+    ok, detail = box.preflight()
+    assert ok
+    assert "UNSAFE" not in detail
+
+
+def test_the_sandbox_is_process_wide_and_resettable(monkeypatch):
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
     sandbox_module.reset_sandbox()
-    assert isinstance(sandbox_module.get_sandbox(), ScriptSandbox)
-
-    monkeypatch.setenv("SE_AGENT_SANDBOX", "docker")
+    first = sandbox_module.get_sandbox()
+    assert first is sandbox_module.get_sandbox()
     sandbox_module.reset_sandbox()
-    assert isinstance(sandbox_module.get_sandbox(), DockerSandbox)
-    sandbox_module.reset_sandbox()
-
-
-def test_docker_remains_the_default(monkeypatch):
-    monkeypatch.delenv("SE_AGENT_SANDBOX", raising=False)
-    sandbox_module.reset_sandbox()
-    assert isinstance(sandbox_module.get_sandbox(), DockerSandbox)
+    assert sandbox_module.get_sandbox() is not first
     sandbox_module.reset_sandbox()
 
 
@@ -173,11 +205,14 @@ def test_docker_remains_the_default(monkeypatch):
 
 
 @needs_bash
-def test_the_script_reports_what_it_isolates(box):
+def test_the_script_reports_which_tier_is_in_force(box):
+    from app.tools.sandbox import TIERS
+
     ok, detail = box.preflight()
     assert ok, detail
-    # Whatever the platform offers, the environment allowlist is unconditional.
-    assert "clean-env" in detail
+    # It must name a tier it actually probed, never a hopeful default.
+    assert box.tier() in TIERS
+    assert detail.startswith(box.tier())
 
 
 @needs_bash
@@ -204,7 +239,7 @@ def test_the_real_script_propagates_a_failing_exit_code(box):
 
 @needs_bash
 def test_the_real_script_reports_a_missing_workspace_as_a_sandbox_failure(tmp_path):
-    box = ScriptSandbox(Workspace(tmp_path))
+    box = Sandbox(Workspace(tmp_path))
     box.workspace.root = tmp_path / "deleted"
     result = box.run("echo hi")
     assert result.sandbox_error
@@ -214,11 +249,80 @@ def test_the_real_script_reports_a_missing_workspace_as_a_sandbox_failure(tmp_pa
 @needs_bash
 def test_the_command_runs_in_the_workspace(tmp_path):
     (tmp_path / "marker.txt").write_text("here", encoding="utf-8")
-    box = ScriptSandbox(Workspace(tmp_path))
+    box = Sandbox(Workspace(tmp_path))
     assert "marker.txt" in box.run("ls").stdout
 
 
-def test_execution_result_shape_is_shared_with_docker():
-    """Both backends feed the same downstream code."""
+def test_a_sandbox_error_is_never_ok():
+    """`ok` is what the tester and the router read; a zero exit is not enough."""
     assert ExecutionResult(exit_code=0).ok
     assert not ExecutionResult(exit_code=0, sandbox_error="boom").ok
+
+
+# ------------------------------------------------------- test-result honesty
+
+
+def test_no_tests_collected_is_an_error_not_a_pass(ready_box, monkeypatch):
+    """pytest exits 5 when it collects nothing; that must not read as success."""
+    stub_popen(monkeypatch, returncode=5, stdout="no tests ran in 0.01s")
+    report = ready_box.run_tests("pytest -q")
+    assert report.execution_error == "no tests were collected"
+    assert not report.is_green
+
+
+def test_collection_crash_is_reported_as_an_execution_error(ready_box, monkeypatch):
+    stub_popen(monkeypatch, returncode=2, stderr="ImportError while loading conftest")
+    report = ready_box.run_tests("pytest -q")
+    assert "failed before any test ran" in report.execution_error
+    assert not report.is_green
+
+
+def test_counts_and_exit_code_come_from_the_process(ready_box, monkeypatch):
+    stub_popen(
+        monkeypatch,
+        returncode=1,
+        stdout=(
+            "FAILED tests/test_x.py::test_y - assert 1 == 2\n"
+            "===== 1 failed, 4 passed in 2.0s ====="
+        ),
+    )
+    report = ready_box.run_tests("pytest -q")
+    assert (report.passed, report.failed, report.exit_code) == (4, 1, 1)
+    assert report.command == "pytest -q"
+    assert not report.is_green
+
+
+def test_a_green_run_is_green(ready_box, monkeypatch):
+    stub_popen(monkeypatch, returncode=0, stdout="===== 6 passed in 0.4s =====")
+    assert ready_box.run_tests("pytest -q").is_green
+
+
+def test_timeout_is_reported_as_a_sandbox_error(ready_box, monkeypatch):
+    """A hung suite is an infrastructure outcome, not a verdict on the code."""
+
+    class Hanging:
+        pid = 9999
+        returncode = None
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise subprocess.TimeoutExpired(cmd="bash", timeout=timeout)
+            return "", ""
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", Hanging)
+    monkeypatch.setattr(sandbox_module, "_terminate", lambda proc: None)
+
+    result = ready_box.run("sleep 999", timeout=1)
+    assert result.timed_out
+    assert result.exit_code == 124
+    assert "time limit" in result.sandbox_error
+
+    report = ready_box.run_tests("pytest -q", timeout=1)
+    assert not report.is_green
+    assert not report.ran, "a timeout must never look like a test result"

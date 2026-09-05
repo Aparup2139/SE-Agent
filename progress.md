@@ -237,3 +237,53 @@ actually in force rather than implying containment.
 2. A Windows path contains a colon, which is also the `PATH` separator, so
    prepending `C:/...` silently produced two nonexistent entries. Everything
    bound for `PATH` now goes through `cygpath -u` first.
+
+## Docker removed; the sandbox tiers itself
+
+Docker is gone -- image, backend class, daemon check, marker and all. There is
+one execution path now: `sandbox/local.sh`.
+
+### Tiers
+
+The script picks the strongest mechanism available and **probes each by running
+it**, so something present but broken (a kernel with unprivileged user
+namespaces disabled) demotes rather than failing every run.
+
+| Tier | Boundary |
+| --- | --- |
+| `bwrap` | mount+net+pid namespaces; workspace is the only writable path |
+| `unshare` | network and user namespace |
+| `none` | clean environment only -- not a boundary |
+
+### The gate
+
+A run **refuses to start** on `none` unless `SE_AGENT_SANDBOX_ALLOW_UNSAFE=1`.
+Unsandboxed execution is now a decision someone made, not a silent default, and
+the preflight string keeps saying `ACCEPTED AS UNSAFE` afterwards so no UI can
+imply otherwise. `SE_AGENT_SANDBOX_REQUIRE` sets a floor in the other
+direction.
+
+### Verified on this machine
+
+- Windows, no flags: preflight **refuses**, naming all three ways forward.
+- `SE_AGENT_SANDBOX_ALLOW_UNSAFE=1`: allowed, labelled `ACCEPTED AS UNSAFE`.
+- `SE_AGENT_SANDBOX_WSL=Ubuntu-24.04`: preflight passes with no gate, tier
+  `unshare`, commands execute in the workspace.
+- Network through the full Python -> WSL -> script path: `BLOCKED` by default,
+  `REACHABLE` only with `network=True`.
+- `NVIDIA_API_KEY`, `SE_AGENT_API_TOKEN`: absent. 13 variables visible.
+
+### Not verified here
+
+`bwrap` is not installed in this WSL distribution and installing it needs sudo,
+so the top tier is implemented and probed but has not been exercised. The probe
+is a functional check rather than a `command -v`, so a broken bwrap demotes to
+`unshare` instead of breaking runs.
+
+### The cost of removing Docker, stated plainly
+
+The container image carried the toolchain. Without it the sandbox uses the
+host's, so reaching a real boundary from Windows means WSL -- and the project's
+dependencies must then be installed inside WSL, because that is the Python that
+will run the tests. There is no way around this that does not reintroduce an
+image.

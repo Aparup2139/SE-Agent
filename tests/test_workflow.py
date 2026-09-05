@@ -244,7 +244,7 @@ async def test_test_gate_routes_a_failure_to_diagnosis():
 async def test_test_gate_treats_a_sandbox_failure_as_a_failure():
     """A sandbox that could not run is never a pass."""
     ctx = FakeContext(
-        {"tests_passed": False, "tests": {"execution_error": "docker unreachable"}}
+        {"tests_passed": False, "tests": {"execution_error": "the sandbox failed to start"}}
     )
     message = await decide_after_tests(ctx)
     assert ctx.route == ROUTE_FAILED
@@ -400,7 +400,7 @@ def test_failure_summary_lists_the_failures():
 
 
 def test_sandbox_failure_summary_does_not_claim_a_test_result():
-    report = TestReport(execution_error="docker daemon unreachable")
+    report = TestReport(execution_error="the sandbox failed to start")
     text = _summarize(report)
     assert "could not run" in text
     assert "passed" not in text
@@ -410,7 +410,7 @@ def test_sandbox_failure_summary_does_not_claim_a_test_result():
 
 
 class FakeSandbox:
-    """Stands in for Docker so the tester's state contract can be exercised."""
+    """Stands in for the sandbox so the tester's state contract can be exercised."""
 
     def __init__(self, report: TestReport, output: str = "raw pytest output"):
         self.report = report
@@ -464,7 +464,7 @@ async def test_tester_writes_a_failing_result_to_state():
 async def test_tester_reports_a_sandbox_failure_as_not_passing():
     """The one failure mode that must never be mistaken for success."""
     state, _ = await _run_tester(
-        TestReport(exit_code=0, execution_error="docker daemon unreachable")
+        TestReport(exit_code=0, execution_error="the sandbox failed to start")
     )
     assert state["tests_passed"] is False
     assert state["tests"]["execution_error"]

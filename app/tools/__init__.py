@@ -18,13 +18,10 @@ from .repo_tools import (
 )
 from .sandbox import (
     EXECUTION_TOOLS,
-    DockerSandbox,
     ExecutionResult,
+    Sandbox,
     SandboxConfig,
     SandboxError,
-    ScriptConfig,
-    ScriptSandbox,
-    docker_available,
     get_sandbox,
     parse_pytest_output,
     reset_sandbox,
@@ -45,9 +42,7 @@ TESTING_TOOLS = [*READ_ONLY_TOOLS, *EXECUTION_TOOLS]
 
 __all__ = [
     "CODING_TOOLS",
-    "DockerSandbox",
-    "ScriptConfig",
-    "ScriptSandbox",
+    "Sandbox",
     "EXECUTION_TOOLS",
     "ExecutionResult",
     "INSPECTION_TOOLS",
@@ -58,7 +53,6 @@ __all__ = [
     "WRITE_TOOLS",
     "Workspace",
     "WorkspaceError",
-    "docker_available",
     "edit_file",
     "get_sandbox",
     "reset_sandbox",

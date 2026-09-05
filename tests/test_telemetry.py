@@ -95,7 +95,7 @@ def test_test_results_are_surfaced():
 def test_a_sandbox_failure_is_not_reported_as_counts():
     tracker = RunTracker()
     updates = tracker.observe(
-        event(state_delta={"tests": {"execution_error": "docker unreachable"}})
+        event(state_delta={"tests": {"execution_error": "the sandbox failed to start"}})
     )
     text = [u for u in updates if u.kind == "tests"][0].text
     assert "could not run" in text

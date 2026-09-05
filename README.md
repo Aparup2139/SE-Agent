@@ -29,15 +29,15 @@ approval.
 structural rather than a matter of instruction. It cannot quietly fix a problem
 instead of reporting it.
 
-**Repository code runs behind a sandbox.** By default that is a container with
-no network, a read-only root filesystem, dropped capabilities, and bounded CPU,
-memory and processes. A script backend is available where Docker is not; it
-applies what the host OS offers and *states plainly what that is*, including
-when the answer is "no boundary" -- see **Sandbox backends**.
+**Repository code runs behind a sandbox, and the sandbox says what it is.**
+`sandbox/local.sh` uses the strongest isolation the host actually provides and
+reports which tier that was. **A run refuses to start with no boundary** unless
+you accept that deliberately -- so "unsandboxed" is a decision someone made,
+never a silent default. See **The sandbox**.
 
-What holds under both is the environment allowlist: `NVIDIA_API_KEY` and your
-host credentials are absent from the environment the tested code sees, rather
-than merely unmentioned.
+Whatever the tier, the environment is an allowlist: `NVIDIA_API_KEY` and your
+host credentials are absent from what the tested code sees, rather than merely
+unmentioned.
 
 **Private reasoning stays private.** Kimi K3 returns its chain-of-thought in a
 separate field. It is dropped in the provider layer, never stored in state, and
@@ -48,8 +48,9 @@ never surfaced in the UI.
 ## Requirements
 
 - Python 3.11+
-- Docker (running) -- executes repository code and tests.
-  A script backend is available instead; see **Sandbox backends** below.
+- `bash` (Git Bash on Windows) -- runs the sandbox script
+- For a real isolation boundary: `bubblewrap` or `unshare` (Linux/WSL).
+  See **The sandbox**; on Windows this means WSL.
 - An NVIDIA NIM API key from <https://build.nvidia.com/>
 
 ## Setup
@@ -73,24 +74,35 @@ message, and never passed into the sandbox.
 
 For a substantially faster first run, also set `NVIDIA_REASONING_EFFORT=low`.
 
-**3. Choose a sandbox backend**
+**3. Set up isolation**
 
-Repository code is never executed unguarded, but you pick how it is guarded.
+Repository code is executed, so it needs a boundary. `sandbox/local.sh` picks
+the strongest one available and **a run refuses to start if that is none**.
 
-*Docker (default, a real security boundary):*
-
-```bash
-docker build -t se-agent-sandbox:latest sandbox/
-```
-
-*Or the script backend, which needs no container:*
+*Linux -- the full boundary:*
 
 ```bash
-export SE_AGENT_SANDBOX=script          # Windows PowerShell: $env:SE_AGENT_SANDBOX="script"
+sudo apt install bubblewrap        # or: dnf install bubblewrap
+bash sandbox/local.sh --probe      # expect: bwrap: filesystem+network+pid namespaces
 ```
 
-See **Sandbox backends** below for what each one actually isolates. On Windows
-the script backend is not a security boundary.
+*Windows -- reach a Linux tier through WSL:*
+
+```bash
+export SE_AGENT_SANDBOX_WSL=Ubuntu-24.04
+```
+
+The tests then run with WSL's toolchain, so install the project's dependencies
+inside that distribution too.
+
+*Or accept no boundary, deliberately:*
+
+```bash
+export SE_AGENT_SANDBOX_ALLOW_UNSAFE=1
+```
+
+Appropriate for a repository you would have run `pytest` in anyway. Not
+appropriate for an untrusted task -- the code runs as you.
 
 **4. Confirm everything is ready**
 
@@ -104,8 +116,7 @@ problem at once rather than failing on the first. `ready` means a run can start.
 **5. Run the tests**
 
 ```bash
-pytest -q                  # 272 passed, 1 skipped
-pytest -q -m "not docker"  # if the Docker daemon is not running
+pytest -q                  # 263 passed, 1 skipped
 ```
 
 ---
@@ -138,8 +149,9 @@ uvicorn app.server:app
 Open <http://127.0.0.1:8000>.
 
 1. The header shows a health dot. **Run stays disabled** until preflight passes,
-   and the problems are printed next to it -- so a stopped Docker daemon is
-   visible before you submit rather than twenty minutes into a run.
+   and the problems are printed next to it -- so a missing isolation boundary
+   is visible before you submit rather than twenty minutes into a run. The
+   line names the active tier, so it never implies containment.
 2. Type the feature request. Optionally set a repository path, the iteration
    budget, and an API token if the server has one configured.
 3. Press **Run**. The response is a server-sent event stream, so progress
@@ -161,7 +173,8 @@ HTTP surface may do:
 | --- | --- |
 | `SE_AGENT_API_TOKEN` | Bearer token required on every run. Unset, the server refuses any caller that is not on loopback. |
 | `SE_AGENT_REPO_ROOT` | The only directory tree a request may target. Unset, the `repo` field is refused outright and runs use the server's own directory. |
-| `SE_AGENT_SANDBOX` | `docker` (default) or `script`. See **Sandbox backends**. |
+| `SE_AGENT_SANDBOX_ALLOW_UNSAFE` | Permit a run with no isolation boundary. See **The sandbox**. |
+| `SE_AGENT_SANDBOX_WSL` | Run the sandbox inside a WSL distribution, to reach a real tier from Windows. |
 
 Neither default is open: an unconfigured server works locally and is inert to
 anyone else. **Do not expose it without setting a token.**
@@ -199,37 +212,63 @@ failure rather than pretending to have succeeded.
 
 ---
 
-## Sandbox backends
+## The sandbox
 
-Repository code is never executed unguarded. Choose the backend with
-`SE_AGENT_SANDBOX`:
+Every command an agent runs goes through `sandbox/local.sh`. It selects a tier
+by **running** each mechanism, not by looking for the binary, so something
+present but broken -- a kernel with unprivileged user namespaces disabled --
+demotes rather than failing every run.
 
-| Value | Isolation |
-| --- | --- |
-| `docker` (default) | A real boundary: no network, read-only root, dropped capabilities, bounded CPU/memory/PIDs, environment allowlist. |
-| `script` | `sandbox/local.sh` -- a network namespace and process ceiling on Linux and WSL; on Windows only a clean environment and a working directory. |
+| Tier | What it gives | Where |
+| --- | --- | --- |
+| `bwrap` | Fresh mount namespace: the workspace is the only writable path, most of the filesystem is not visible at all. No network, own PID and IPC space. | Linux/WSL with bubblewrap |
+| `unshare` | Network and user namespace. Bounds what the command can *reach*, not what it can read. | Linux/WSL |
+| `none` | A clean environment and a working directory. **Not a boundary.** | Windows, bare |
 
 ```bash
-SE_AGENT_SANDBOX=script python -m app.agent --repo . "add a word-count helper"
+bash sandbox/local.sh --probe     # what is in force here
 ```
 
-**On Windows the script backend is not a security boundary.** The agent's code
-runs as you, with your files and your network. It is appropriate for a
-repository you would have run `pytest` in anyway; it is not appropriate for an
-untrusted task. Read `sandbox/local.sh` -- it is short, and it states exactly
-what it applies on each platform. `preflight()` reports the same, so the
-console's health line never claims containment it does not have.
+`preflight()` reports the same string, so the console's health line states the
+active tier rather than implying containment.
 
-What holds on every platform is the environment allowlist: the command starts
-from `env -i` and receives only what the script lists, so `NVIDIA_API_KEY` and
-every other host secret are absent rather than merely unmentioned.
+**A run refuses to start on `none`.** Set `SE_AGENT_SANDBOX_ALLOW_UNSAFE=1` to
+accept it; the preflight message then ends in `ACCEPTED AS UNSAFE`, and keeps
+saying so. To go the other way and refuse anything weaker than a chosen tier:
 
-Because the clean environment also discards any active virtualenv, the script
-prefers the workspace's own `.venv`; `SE_AGENT_SANDBOX_PATH` overrides that
-with a directory to put first on `PATH`.
+```bash
+SE_AGENT_SANDBOX_REQUIRE=bwrap    # or unshare
+```
 
-The script's contract is deliberately small, so a different mechanism is a new
-script rather than new Python:
+### What holds at every tier
+
+The command starts from `env -i` and receives only the variables the script
+lists, so `NVIDIA_API_KEY` and every other host secret are absent rather than
+merely unmentioned. It runs in the workspace, with a private `HOME` and
+`TMPDIR`, a file-size ceiling, a process ceiling, and a wall-clock timeout
+enforced twice -- once by the script, once by the caller, which kills the whole
+process group so a runaway suite cannot outlive it.
+
+### Windows
+
+The namespaces are Linux's, so Windows reaches only `none` on its own.
+`SE_AGENT_SANDBOX_WSL=<distro>` runs the script inside WSL, where `unshare`
+works and bubblewrap can be installed.
+
+The trade-off is real: the tests then run with **WSL's** Python, not Windows',
+so the project's dependencies must exist there. That is the cost of a boundary
+without a container -- there is no image carrying the toolchain any more.
+
+### The interpreter
+
+A clean environment also discards any active virtualenv, so the script prefers
+the workspace's own `.venv`. `SE_AGENT_SANDBOX_PATH` overrides that with a
+directory to put first on `PATH`.
+
+### The contract
+
+Deliberately small, so a different mechanism is a new script rather than new
+Python. `SE_AGENT_SANDBOX_CMD` points at one:
 
 ```
 script <session-id> <timeout-seconds> <command>
@@ -302,8 +341,7 @@ process, so no agent is in a position to describe it differently.
 
 | Edge case | What must happen | Check it |
 | --- | --- | --- |
-| `NVIDIA_API_KEY` reaching repository code | Absent from the sandbox environment | `pytest -q -k nvidia_key_never_reaches_the_container` |
-| The same, script backend | Absent, on every platform | `pytest -q -k real_script_hides_the_nvidia_key` |
+| `NVIDIA_API_KEY` reaching repository code | Absent from the sandbox environment, at every tier | `pytest -q -k real_script_hides_the_nvidia_key` |
 | Any other host secret | Only an explicit allowlist is forwarded | `pytest -q -k no_host_secret_is_forwarded` |
 | The key in a log or exception | Redacted | `pytest -q -k api_key_is_redacted_from_error_text` |
 | The key in `repr()` | Excluded from the model | `pytest -q -k api_key_never_appears_in_repr` |
@@ -365,16 +403,27 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/api/run \
 
 | Edge case | What must happen | How to reproduce |
 | --- | --- | --- |
-| Docker not running | Named in preflight, Run disabled in the console | Stop Docker Desktop, then `python -c "from app.agent import preflight; print(preflight())"` |
-| The sandbox image not built | Preflight says exactly which command builds it | `docker image rm se-agent-sandbox:latest`, then preflight |
-| No container runtime at all | Switch backends and continue | `SE_AGENT_SANDBOX=script python -c "from app.agent import preflight; print(preflight() or 'ready')"` |
-| `bash` missing for the script backend | Preflight says so and names the alternative | `PATH= python -c "from app.tools.sandbox import ScriptSandbox; print(ScriptSandbox().preflight())"` |
+| No isolation available | **The run refuses to start** | `python -c "from app.agent import preflight; print(preflight())"` on a host with no namespaces |
+| That refusal overridden | Allowed, but still labelled unsafe | `pytest -q -k the_gate_can_be_opened_deliberately` |
+| A real tier present | No gate, no warning | `pytest -q -k a_real_tier_needs_no_gate` |
+| A required tier unavailable | Refused by the script itself | `SE_AGENT_SANDBOX_REQUIRE=bwrap bash sandbox/local.sh s 30 'echo hi'; echo $?` -> 97 |
+| `bash` missing | Preflight says so and names the alternative | `PATH= python -c "from app.tools.sandbox import Sandbox; print(Sandbox().preflight())"` |
 | A runaway test suite | Killed with its children, reported as a timeout | `pytest -q -k timeout_is_reported_as_a_sandbox_error` |
 | Which isolation is actually active | Stated, never assumed | `bash sandbox/local.sh --probe` |
 
-That last one is worth running before you trust the script backend. On Linux it
-prints a network namespace and process ceiling; on Windows it prints
-`(no isolation boundary)`, and the console's health line says the same.
+Check the network boundary itself, on a host that has one:
+
+```bash
+SE_AGENT_WORKSPACE=$PWD bash sandbox/local.sh t 30 \
+  'getent hosts pypi.org >/dev/null 2>&1 && echo REACHABLE || echo BLOCKED'
+# BLOCKED
+
+SE_AGENT_WORKSPACE=$PWD SE_AGENT_SANDBOX_NETWORK=1 bash sandbox/local.sh t 30 \
+  'getent hosts pypi.org >/dev/null 2>&1 && echo REACHABLE || echo BLOCKED'
+# REACHABLE
+```
+
+The last row is the one to run before trusting the sandbox anywhere new.
 
 ---
 
@@ -448,10 +497,9 @@ app/
 │   ├── config.py       settings and key hygiene
 │   ├── nvidia_kimi.py  HTTP client: retries, error taxonomy, streaming
 │   └── adk_model.py    KimiK3Llm(BaseLlm), registered with LLMRegistry
-├── tools/            repository tools and the sandbox backends
+├── tools/            repository tools and the sandbox
 └── schemas/          the typed contract between stages
-sandbox/Dockerfile    the execution image
-sandbox/local.sh      the script backend
+sandbox/local.sh      the isolation script -- read this one
 evaluation/fixtures/  sample projects to run against
 ```
 
@@ -476,13 +524,12 @@ workflow, memory -- is stock ADK.
 ## Development
 
 ```bash
-pytest -q                  # full suite
-pytest -q -m "not docker"  # skip tests needing a Docker daemon
+pytest -q                  # full suite: 263 passed, 1 skipped
 ruff check app tests
 ```
 
-The suite covers path-traversal and secret-file refusal, sandbox isolation on
-both backends, pytest output parsing (including the cases that must not read as
+The suite covers path-traversal and secret-file refusal, sandbox isolation and
+its refusal to run unguarded, pytest output parsing (including the cases that must not read as
 a pass), every routing decision, and the ADK/NIM translation in both directions.
 `tests/test_graph_integration.py` runs the whole graph -- real runner, real
 routing, real tester -- against a stub model, so every branch is covered without

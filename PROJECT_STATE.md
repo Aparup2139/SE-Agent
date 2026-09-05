@@ -11,7 +11,7 @@ done.
 ## Completed work
 
 **Phase 1 -- provider layer and ADK bridge**
-- Python 3.13.5, `google-adk==2.8.0` in `.venv/`, Docker 28.3.0, git initialized.
+- Python 3.13.5, `google-adk==2.8.0` in `.venv/`, git initialized.
 - `app/llm/` is the only path to NVIDIA NIM: validated config with key hygiene,
   bounded retries, a typed error taxonomy, sync/async, streaming.
 - `app/llm/adk_model.py`: `KimiK3Llm(BaseLlm)` registered with `LLMRegistry`.
@@ -19,12 +19,10 @@ done.
 **Phase 2 -- schemas, tools, agents, workflow**
 - `app/schemas/`: the typed contract between stages, with enforced size limits.
 - `app/tools/`: path-confined repository tools; secrets and binaries refused.
-- `app/tools/sandbox.py` + `sandbox/Dockerfile`: Docker execution with no
-  network, read-only root, dropped capabilities, allowlisted environment.
-- `sandbox/local.sh` + `ScriptSandbox`: a second backend (`SE_AGENT_SANDBOX=script`)
-  that needs no container. Applies a network namespace and process ceiling on
-  Linux/WSL, and only a clean environment on Windows -- where it is explicitly
-  not a security boundary. Both backends share one test parser.
+- `sandbox/local.sh` + `app/tools/sandbox.py`: the only execution path. Tiers
+  itself bwrap > unshare > none, probing each by running it. A run refuses to
+  start on `none` unless `SE_AGENT_SANDBOX_ALLOW_UNSAFE=1`.
+  `SE_AGENT_SANDBOX_WSL` reaches a real tier from Windows.
 - `app/agents/`: ten agents, all Kimi K3 except the model-free tester.
 - `app/workflows/graph.py`: ADK 2.8.0 `Workflow` graph with explicit routing.
 
@@ -44,6 +42,10 @@ done.
    those, and `Workflow` is what provides explicit routing and real cycles.
 3. **The tester has no model** -- its `TestReport` comes from a process exit
    code and stdout, so a model cannot fabricate a pass.
+3b. **Docker was removed entirely.** One execution path is easier to reason
+    about than two; bwrap reproduces the container's guarantees where a real
+    boundary is available, and where none is, the run refuses to start rather
+    than pretending.
 4. **Agents are factories** -- ADK allows one parent per instance.
 5. **Routing reads structured state**, and an unparseable review routes to
    "changes required", never to approval.
@@ -59,11 +61,11 @@ done.
 
 ## Tests / status
 
-`pytest -q` -> **272 passed, 1 skipped** (symlink test needs Windows
+`pytest -q` -> **263 passed, 1 skipped** (symlink test needs Windows
 privileges). Lint clean.
 
 Verified live against the provider: NIM chat completion, NIM function calling, a
-full ADK agent loop, Docker sandbox execution, that `NVIDIA_API_KEY` does not
+full ADK agent loop, sandboxed execution, that `NVIDIA_API_KEY` does not
 reach the sandbox, structured output round-tripping through
 `set_model_response`, and the tester catching a deliberately introduced bug
 with the exact failing assertion.
@@ -82,7 +84,8 @@ quota.
 - **Free NIM tiers rate-limit hard.** 429s are retried on a 5s/10s/20s/40s/60s
   schedule; a run that exhausts the budget reports failure rather than faking
   success.
-- Docker Desktop must be running; `preflight()` says so clearly when it is not.
+- `preflight()` names the active isolation tier, and blocks a run that would
+  have none unless that was accepted explicitly.
 
 ## Blockers
 

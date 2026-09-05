@@ -42,7 +42,7 @@ def test_errors_are_not_green():
 
 def test_sandbox_failure_is_not_green_even_with_zero_exit():
     report = TestReport(
-        passed=5, test_count=5, exit_code=0, execution_error="docker daemon unreachable"
+        passed=5, test_count=5, exit_code=0, execution_error="the sandbox failed to start"
     )
     assert not report.is_green
     assert not report.ran

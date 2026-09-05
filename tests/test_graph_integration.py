@@ -1,7 +1,7 @@
 """End-to-end graph execution against a stub model.
 
 These tests run the *real* workflow -- the real ADK Runner, the real graph, the
-real routing nodes and the real tester agent -- with the model and the Docker
+real routing nodes and the real tester agent -- with the model and the
 sandbox replaced. That isolates the orchestration, which is the part that must
 be correct regardless of what any model says, and lets it be verified without
 network access or provider quota.
@@ -181,7 +181,7 @@ LLMRegistry.register(StubLlm)
 
 
 class StubSandbox:
-    """Stands in for Docker. Returns a scripted sequence of test results."""
+    """Stands in for the sandbox. Returns a scripted sequence of test results."""
 
     def __init__(self, reports: list[TestReport]):
         self.reports = list(reports)
@@ -323,7 +323,7 @@ async def test_a_green_suite_with_no_diff_never_reaches_review(stub_everything):
 @pytest.mark.asyncio
 async def test_a_sandbox_failure_never_reaches_review(stub_everything):
     stub_everything(
-        [TestReport(exit_code=0, execution_error="docker unreachable")], ["a.py"]
+        [TestReport(exit_code=0, execution_error="the sandbox failed to start")], ["a.py"]
     )
     StubLlm.responses = {"Code Reviewer": review_payload(ReviewVerdict.APPROVED)}
 

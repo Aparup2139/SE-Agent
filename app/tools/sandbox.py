@@ -1,27 +1,31 @@
 """Isolated execution for repository code.
 
-Nothing the agents write should be executed on the host unguarded. Two backends
-provide that, chosen with ``SE_AGENT_SANDBOX``:
+Everything an agent writes is executed through ``sandbox/local.sh``, which
+applies the strongest isolation the host actually provides and reports which
+that was. The script owns every OS-specific decision; this module owns the
+process, the timeout, and the distinction between a failed command and a
+failed sandbox.
 
-``docker`` (default)
-    A short-lived container with the repository bind-mounted and a deliberately
-    hostile environment: no host credentials, no network, a read-only root
-    filesystem apart from the workspace, dropped capabilities, and hard limits
-    on CPU, memory, processes and wall-clock time. A real security boundary.
+Tiers, strongest first -- the script probes each by running it, so a mechanism
+that is present but broken demotes rather than failing every run:
 
-``script``
-    Delegates to ``sandbox/local.sh`` (override with ``SE_AGENT_SANDBOX_CMD``),
-    which applies whatever the host OS actually offers -- a network namespace
-    and process ceiling on Linux and WSL, only a clean environment and a
-    working-directory change on Windows. Read that script before relying on it:
-    on Windows it is **not** a security boundary.
+``bwrap``
+    A real boundary. Fresh mount namespace, the workspace the only writable
+    path, no network, its own PID and IPC space.
+``unshare``
+    Network and user namespace. Bounds what the command can reach, not what it
+    can read.
+``none``
+    A clean environment only. Not a boundary -- and a run refuses to start on
+    it unless ``SE_AGENT_SANDBOX_ALLOW_UNSAFE=1`` says that is intended.
 
-What both guarantee is the environment allowlist. The child is built from an
-explicit set of variables rather than inheriting yours, so ``NVIDIA_API_KEY``
-and every other host secret stay out of repository code.
+On Windows only ``none`` is reachable, because the namespaces are Linux's.
+``SE_AGENT_SANDBOX_WSL`` runs the script inside WSL to reach the others; note
+that this also means the tests run with WSL's toolchain, not Windows'.
 
-Both share one test-output parser and one :class:`TestReport` path, so no
-backend can report a pass the other would not.
+What holds at every tier is the environment allowlist: the command starts from
+``env -i`` and receives only what the script lists, so ``NVIDIA_API_KEY`` and
+every other host secret are absent rather than merely unmentioned.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ import re
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..schemas import TestReport
@@ -40,23 +44,17 @@ from .workspace import MAX_OUTPUT_CHARS, Workspace, clamp, get_workspace
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_IMAGE = "se-agent-sandbox:latest"
-FALLBACK_IMAGE = "python:3.11-slim"
 DEFAULT_TIMEOUT = 600
-CONTAINER_WORKDIR = "/workspace"
 
-# Resource ceilings. A runaway test suite should die, not take the host with it.
-MEMORY_LIMIT = "2g"
-CPU_LIMIT = "2"
-PID_LIMIT = "512"
-
-
-# The script backend's reserved code for "the sandbox failed", as distinct from
-# "the command failed". Conflating the two would let a broken sandbox read as a
-# red test suite and send the debugger after a bug that does not exist.
+# The script's reserved code for "the sandbox failed", as distinct from "the
+# command failed". Conflating the two would let a broken sandbox read as a red
+# test suite and send the debugger after a bug that does not exist.
 SANDBOX_FAILED_EXIT = 97
 
 DEFAULT_SCRIPT = Path(__file__).resolve().parents[2] / "sandbox" / "local.sh"
+
+# Tiers in ascending order of isolation, as the script reports them.
+TIERS = ("none", "unshare", "bwrap")
 
 
 class SandboxError(Exception):
@@ -85,69 +83,213 @@ class ExecutionResult:
         return "\n".join(parts)
 
 
+def _base_env() -> dict[str, str]:
+    """The minimum needed to start a shell -- and nothing else.
+
+    The script does its own ``env -i``, so this is belt and braces; it also
+    means an accidental edit to the script cannot leak a variable this layer
+    never passed in.
+    """
+    env = {"PATH": os.environ.get("PATH", "")}
+    for key in (
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        # Lets the caller point the sandbox at a specific interpreter.
+        "SE_AGENT_SANDBOX_PATH",
+        # The isolation floor a run refuses to drop below.
+        "SE_AGENT_SANDBOX_REQUIRE",
+    ):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Kill the command *and its children*.
+
+    ``subprocess`` only signals the direct child, which for a shell script is
+    the shell. Killing that leaves the test suite running, which is how a
+    "timed out" run keeps burning CPU long after it was given up on.
+    """
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            check=False,
+        )
+    else:
+        import signal
+
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    proc.kill()
+
+
+def allow_unsafe() -> bool:
+    """Whether running without an isolation boundary has been accepted."""
+    return (os.environ.get("SE_AGENT_SANDBOX_ALLOW_UNSAFE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 @dataclass
 class SandboxConfig:
-    image: str = DEFAULT_IMAGE
+    script: str = ""
     timeout: int = DEFAULT_TIMEOUT
     network: bool = False
-    memory: str = MEMORY_LIMIT
-    cpus: str = CPU_LIMIT
-    # Only these variables cross into the container. Host secrets never do.
-    env_allowlist: dict[str, str] = field(
-        default_factory=lambda: {
-            "PYTHONUNBUFFERED": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-            "CI": "1",
-            "HOME": "/tmp",
-        }
-    )
+    # A WSL distribution to run the script in, for hosts whose own OS offers
+    # no namespaces. Empty means run on this host directly.
+    wsl_distro: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.script:
+            self.script = os.environ.get("SE_AGENT_SANDBOX_CMD") or str(DEFAULT_SCRIPT)
+        if not self.wsl_distro:
+            self.wsl_distro = (os.environ.get("SE_AGENT_SANDBOX_WSL") or "").strip()
 
 
-def docker_available() -> tuple[bool, str]:
-    """Check that a Docker daemon is actually reachable, not just installed."""
-    if shutil.which("docker") is None:
-        return False, "docker is not installed or not on PATH"
-    try:
+class Sandbox:
+    """Runs commands through the isolation script.
+
+    The script's contract is deliberately tiny, so a different mechanism is a
+    new script rather than new Python::
+
+        script <session-id> <timeout-seconds> <command>   -> the command's exit
+        exit 97                                           -> the sandbox failed
+    """
+
+    def __init__(
+        self,
+        workspace: Workspace | None = None,
+        config: SandboxConfig | None = None,
+        session_id: str = "default",
+    ) -> None:
+        self.workspace = workspace or get_workspace()
+        self.config = config or SandboxConfig()
+        self.session_id = session_id
+        self._tier: str | None = None
+
+    # ------------------------------------------------------------------ setup
+
+    @property
+    def uses_wsl(self) -> bool:
+        return bool(self.config.wsl_distro) and os.name == "nt"
+
+    def _script_path(self) -> str:
+        """The script's path as the shell that will run it understands it."""
+        native = str(Path(self.config.script).resolve())
+        if not self.uses_wsl:
+            return native
+        return self._to_wsl_path(native)
+
+    def _to_wsl_path(self, windows_path: str) -> str:
         result = subprocess.run(
-            ["docker", "info", "--format", "{{.ServerVersion}}"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "docker daemon did not respond within 20s"
-    except OSError as exc:
-        return False, f"could not invoke docker: {exc}"
-
-    if result.returncode != 0:
-        return False, f"docker daemon unreachable: {(result.stderr or '').strip()[:200]}"
-    return True, f"docker server {result.stdout.strip()}"
-
-
-def image_exists(image: str) -> bool:
-    try:
-        result = subprocess.run(
-            ["docker", "image", "inspect", image],
+            ["wsl.exe", "-d", self.config.wsl_distro, "wslpath", "-a", windows_path],
             capture_output=True,
             text=True,
             timeout=30,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
+        if result.returncode != 0:
+            raise SandboxError(
+                f"could not translate {windows_path} for WSL: {result.stderr.strip()}"
+            )
+        return result.stdout.strip().strip("\x00")
 
+    def _launcher(self) -> list[str]:
+        """The argv prefix that gets us a shell on the target OS."""
+        if self.uses_wsl:
+            return ["wsl.exe", "-d", self.config.wsl_distro, "--", "env"]
+        shell = shutil.which("bash")
+        if shell is None:
+            raise SandboxError(
+                "bash is required to run the sandbox script and is not on PATH "
+                "(install Git Bash, or set SE_AGENT_SANDBOX_WSL to use WSL)"
+            )
+        return [shell]
 
-class _BaseSandbox:
-    """What every backend must provide, and what they all share.
+    def tier(self) -> str:
+        """Which isolation tier is actually in force. Cached per instance."""
+        if self._tier is None:
+            self._tier = self._ask_script("--tier") or "none"
+        return self._tier
 
-    Backends differ only in :meth:`run` and :meth:`preflight`. Everything that
-    turns a process result into a :class:`TestReport` lives here, once, so a
-    green suite means the same thing regardless of where it ran.
-    """
+    def _ask_script(self, flag: str) -> str:
+        try:
+            launcher = self._launcher()
+            prefix = [*launcher, "bash"] if self.uses_wsl else launcher
+            args = [*prefix, self._script_path(), flag]
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=60, env=_base_env()
+            )
+        except (OSError, subprocess.TimeoutExpired, SandboxError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip().splitlines()[-1].strip() if result.stdout else ""
 
     def preflight(self) -> tuple[bool, str]:
-        raise NotImplementedError
+        """Confirm the sandbox can run, and report what it actually isolates."""
+        script = Path(self.config.script)
+        if not script.is_file():
+            return False, f"sandbox script not found: {script}"
+
+        try:
+            self._launcher()
+        except SandboxError as exc:
+            return False, str(exc)
+
+        probe = self._ask_script("--probe")
+        if not probe:
+            return False, (
+                "the sandbox script did not run"
+                + (f" in WSL distro {self.config.wsl_distro}" if self.uses_wsl else "")
+            )
+
+        where = f" via WSL:{self.config.wsl_distro}" if self.uses_wsl else ""
+
+        # An unboundaried run has to be chosen, not stumbled into.
+        if self.tier() == "none" and not allow_unsafe():
+            return False, (
+                f"no isolation boundary is available here ({probe}){where}. "
+                "Repository code would run as you, with your files and network. "
+                "Set SE_AGENT_SANDBOX_WSL=<distro> to run inside WSL, install "
+                "bubblewrap for a full boundary, or set "
+                "SE_AGENT_SANDBOX_ALLOW_UNSAFE=1 to accept this deliberately."
+            )
+
+        unsafe = " -- ACCEPTED AS UNSAFE" if self.tier() == "none" else ""
+        return True, f"{probe}{where}{unsafe}"
+
+    def _args(self, command: str, timeout: int, network: bool = False) -> list[str]:
+        launcher = self._launcher()
+        tail = [self._script_path(), self.session_id, str(timeout), command]
+        if self.uses_wsl:
+            # `wsl -- env VAR=... bash script` is how the environment crosses
+            # the boundary; WSLENV is fiddly and this is explicit.
+            return [
+                *launcher,
+                f"SE_AGENT_WORKSPACE={self._workspace_path()}",
+                f"SE_AGENT_SANDBOX_NETWORK={'1' if network else '0'}",
+                "bash",
+                *tail,
+            ]
+        return [*launcher, *tail]
+
+    def _workspace_path(self) -> str:
+        native = str(self.workspace.root)
+        return self._to_wsl_path(native) if self.uses_wsl else native
+
+    # ------------------------------------------------------------- execution
 
     def run(
         self,
@@ -155,9 +297,87 @@ class _BaseSandbox:
         timeout: int | None = None,
         network: bool | None = None,
     ) -> ExecutionResult:
-        raise NotImplementedError
+        """Execute one command inside the sandbox."""
+        if not command or not command.strip():
+            return ExecutionResult(exit_code=1, sandbox_error="command is required")
 
-    def run_tests(self, command: str = "pytest -q", timeout: int | None = None) -> TestReport:
+        ok, detail = self.preflight()
+        if not ok:
+            return ExecutionResult(exit_code=1, command=command, sandbox_error=detail)
+
+        limit = timeout or self.config.timeout
+        use_network = self.config.network if network is None else network
+
+        env = _base_env()
+        try:
+            args = self._args(command, limit, network=use_network)
+            env["SE_AGENT_WORKSPACE"] = self._workspace_path()
+        except SandboxError as exc:
+            return ExecutionResult(exit_code=1, command=command, sandbox_error=str(exc))
+        env["SE_AGENT_SANDBOX_NETWORK"] = "1" if use_network else "0"
+
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                # A process group of its own, so a timeout can take the whole
+                # tree rather than just the shell.
+                start_new_session=os.name != "nt",
+                creationflags=(
+                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+                ),
+            )
+        except OSError as exc:
+            return ExecutionResult(
+                exit_code=1, command=command, sandbox_error=f"could not start: {exc}"
+            )
+
+        try:
+            # A little slack over the script's own timeout, so its polite
+            # termination gets a chance before this forcible one.
+            stdout, stderr = proc.communicate(timeout=limit + 15)
+        except subprocess.TimeoutExpired:
+            _terminate(proc)
+            stdout, stderr = proc.communicate()
+            return ExecutionResult(
+                exit_code=124,
+                command=command,
+                duration_seconds=time.monotonic() - started,
+                timed_out=True,
+                sandbox_error=f"command exceeded the {limit}s time limit",
+            )
+
+        duration = time.monotonic() - started
+        stdout_text, _ = clamp(stdout or "", MAX_OUTPUT_CHARS)
+        stderr_text, _ = clamp(stderr or "", MAX_OUTPUT_CHARS // 2)
+
+        if proc.returncode == SANDBOX_FAILED_EXIT:
+            return ExecutionResult(
+                exit_code=proc.returncode,
+                command=command,
+                duration_seconds=duration,
+                sandbox_error=(stderr_text.strip() or "the sandbox failed to run"),
+            )
+
+        return ExecutionResult(
+            exit_code=proc.returncode,
+            stdout=stdout_text,
+            stderr=stderr_text,
+            duration_seconds=duration,
+            command=command,
+        )
+
+    # ------------------------------------------------------------------ tests
+
+    def run_tests(
+        self, command: str = "pytest -q", timeout: int | None = None
+    ) -> TestReport:
         """Run the project's test suite and parse the real result."""
         return self.run_tests_with_output(command, timeout=timeout)[0]
 
@@ -200,123 +420,6 @@ class _BaseSandbox:
                 f"{result.combined_output.strip()[:400]}"
             )
         return report, result.combined_output
-
-
-class DockerSandbox(_BaseSandbox):
-    """Runs commands against the workspace inside a throwaway container."""
-
-    def __init__(
-        self,
-        workspace: Workspace | None = None,
-        config: SandboxConfig | None = None,
-    ) -> None:
-        self.workspace = workspace or get_workspace()
-        self.config = config or SandboxConfig()
-
-    # ------------------------------------------------------------------ setup
-
-    def preflight(self) -> tuple[bool, str]:
-        """Verify the sandbox can run before an agent depends on it."""
-        available, detail = docker_available()
-        if not available:
-            return False, detail
-        if not image_exists(self.config.image):
-            if self.config.image != FALLBACK_IMAGE and image_exists(FALLBACK_IMAGE):
-                logger.warning(
-                    "sandbox image %s missing; falling back to %s",
-                    self.config.image,
-                    FALLBACK_IMAGE,
-                )
-                self.config.image = FALLBACK_IMAGE
-                return True, f"{detail}; using fallback image {FALLBACK_IMAGE}"
-            return False, (
-                f"sandbox image {self.config.image} is not present. "
-                f"Build it with: docker build -t {DEFAULT_IMAGE} sandbox/"
-            )
-        return True, detail
-
-    def _docker_args(self, command: str, network: bool | None = None) -> list[str]:
-        """Assemble the `docker run` invocation for one command."""
-        mount = f"{self.workspace.root}:{CONTAINER_WORKDIR}"
-        args = [
-            "docker", "run", "--rm",
-            "--workdir", CONTAINER_WORKDIR,
-            "--volume", mount,
-            # Isolation: no new privileges, no capabilities, bounded resources.
-            "--security-opt", "no-new-privileges",
-            "--cap-drop", "ALL",
-            "--memory", self.config.memory,
-            "--cpus", self.config.cpus,
-            "--pids-limit", PID_LIMIT,
-            # Writable scratch space so pytest and pip can work with a
-            # read-only root filesystem.
-            "--read-only",
-            "--tmpfs", "/tmp:rw,exec,size=512m",
-        ]
-        use_network = self.config.network if network is None else network
-        if not use_network:
-            args.extend(["--network", "none"])
-
-        for key, value in self.config.env_allowlist.items():
-            args.extend(["--env", f"{key}={value}"])
-
-        args.extend([self.config.image, "sh", "-lc", command])
-        return args
-
-    # ------------------------------------------------------------- execution
-
-    def run(
-        self,
-        command: str,
-        timeout: int | None = None,
-        network: bool | None = None,
-    ) -> ExecutionResult:
-        """Execute a shell command inside the container."""
-        if not command or not command.strip():
-            return ExecutionResult(exit_code=1, sandbox_error="command is required")
-
-        ok, detail = self.preflight()
-        if not ok:
-            return ExecutionResult(
-                exit_code=1, command=command, sandbox_error=detail
-            )
-
-        limit = timeout or self.config.timeout
-        args = self._docker_args(command, network=network)
-        started = time.monotonic()
-
-        try:
-            completed = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                timeout=limit,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except subprocess.TimeoutExpired:
-            return ExecutionResult(
-                exit_code=124,
-                command=command,
-                duration_seconds=time.monotonic() - started,
-                timed_out=True,
-                sandbox_error=f"command exceeded the {limit}s time limit",
-            )
-        except OSError as exc:
-            return ExecutionResult(
-                exit_code=1, command=command, sandbox_error=f"docker run failed: {exc}"
-            )
-
-        stdout, _ = clamp(completed.stdout or "", MAX_OUTPUT_CHARS)
-        stderr, _ = clamp(completed.stderr or "", MAX_OUTPUT_CHARS // 2)
-
-        return ExecutionResult(
-            exit_code=completed.returncode,
-            stdout=stdout,
-            stderr=stderr,
-            duration_seconds=time.monotonic() - started,
-            command=command,
-        )
 
 
 # --------------------------------------------------------------- output parsing
@@ -367,235 +470,25 @@ def parse_pytest_output(output: str) -> TestReport:
     return report
 
 
-# ------------------------------------------------------------- script backend
+_sandbox: Sandbox | None = None
 
 
-def _base_env() -> dict[str, str]:
-    """The minimum needed to start a shell -- and nothing else.
-
-    The script does its own ``env -i``, so this is belt and braces; it also
-    means an accidental edit to the script cannot leak a variable this layer
-    never passed in.
-    """
-    env = {"PATH": os.environ.get("PATH", "")}
-    for key in (
-        "SYSTEMROOT",
-        "WINDIR",
-        "COMSPEC",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-        "LANG",
-        # Lets the caller point the sandbox at a specific interpreter.
-        "SE_AGENT_SANDBOX_PATH",
-    ):
-        value = os.environ.get(key)
-        if value:
-            env[key] = value
-    return env
-
-
-def _terminate(proc: subprocess.Popen) -> None:
-    """Kill the command *and its children*.
-
-    ``subprocess`` only signals the direct child, which for a shell script is
-    the shell. Killing that leaves the test suite running, which is how a
-    "timed out" run keeps burning CPU long after it was given up on.
-    """
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-            check=False,
-        )
-    else:
-        import signal
-
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    proc.kill()
-
-
-@dataclass
-class ScriptConfig:
-    script: str = ""
-    timeout: int = DEFAULT_TIMEOUT
-    network: bool = False
-
-    def __post_init__(self) -> None:
-        if not self.script:
-            self.script = os.environ.get("SE_AGENT_SANDBOX_CMD") or str(DEFAULT_SCRIPT)
-
-
-class ScriptSandbox(_BaseSandbox):
-    """Runs commands through a shell script that applies the isolation.
-
-    The script owns every OS-specific decision, so swapping in a different
-    mechanism later -- OpenShell, bubblewrap, a VM -- is a new script rather
-    than new Python. The contract is deliberately tiny::
-
-        script <session-id> <timeout-seconds> <command>   -> the command's exit
-        exit 97                                           -> the sandbox failed
-    """
-
-    def __init__(
-        self,
-        workspace: Workspace | None = None,
-        config: ScriptConfig | None = None,
-        session_id: str = "default",
-    ) -> None:
-        self.workspace = workspace or get_workspace()
-        self.config = config or ScriptConfig()
-        self.session_id = session_id
-        self._probe: str | None = None
-
-    # ------------------------------------------------------------------ setup
-
-    def preflight(self) -> tuple[bool, str]:
-        """Confirm the script can run, and report what it actually isolates."""
-        script = Path(self.config.script)
-        if not script.is_file():
-            return False, f"sandbox script not found: {script}"
-
-        shell = shutil.which("bash")
-        if shell is None:
-            return False, (
-                "bash is required for the script sandbox and is not on PATH "
-                "(install Git Bash, or use SE_AGENT_SANDBOX=docker)"
-            )
-
-        if self._probe is None:
-            try:
-                probe = subprocess.run(
-                    [shell, str(script), "--probe"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    env=_base_env(),
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                return False, f"sandbox script is not runnable: {exc}"
-            if probe.returncode != 0:
-                detail = (probe.stderr or "").strip()[:200]
-                return False, f"sandbox script probe failed: {detail}"
-            self._probe = probe.stdout.strip()
-
-        return True, f"script sandbox ({self._probe})"
-
-    def _args(self, command: str, timeout: int) -> list[str]:
-        return [
-            shutil.which("bash") or "bash",
-            str(Path(self.config.script)),
-            self.session_id,
-            str(timeout),
-            command,
-        ]
-
-    # ------------------------------------------------------------- execution
-
-    def run(
-        self,
-        command: str,
-        timeout: int | None = None,
-        network: bool | None = None,
-    ) -> ExecutionResult:
-        if not command or not command.strip():
-            return ExecutionResult(exit_code=1, sandbox_error="command is required")
-
-        ok, detail = self.preflight()
-        if not ok:
-            return ExecutionResult(exit_code=1, command=command, sandbox_error=detail)
-
-        limit = timeout or self.config.timeout
-        use_network = self.config.network if network is None else network
-
-        env = _base_env()
-        env["SE_AGENT_WORKSPACE"] = str(self.workspace.root)
-        env["SE_AGENT_SANDBOX_NETWORK"] = "1" if use_network else "0"
-
-        started = time.monotonic()
-        try:
-            proc = subprocess.Popen(
-                self._args(command, limit),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                # A process group of its own, so a timeout can take the whole
-                # tree rather than just the shell.
-                start_new_session=os.name != "nt",
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-                ),
-            )
-        except OSError as exc:
-            return ExecutionResult(
-                exit_code=1, command=command, sandbox_error=f"could not start: {exc}"
-            )
-
-        try:
-            # A little slack over the script's own timeout, so its polite
-            # termination gets a chance before this forcible one.
-            stdout, stderr = proc.communicate(timeout=limit + 15)
-        except subprocess.TimeoutExpired:
-            _terminate(proc)
-            stdout, stderr = proc.communicate()
-            return ExecutionResult(
-                exit_code=124,
-                command=command,
-                duration_seconds=time.monotonic() - started,
-                timed_out=True,
-                sandbox_error=f"command exceeded the {limit}s time limit",
-            )
-
-        duration = time.monotonic() - started
-        stdout_text, _ = clamp(stdout or "", MAX_OUTPUT_CHARS)
-        stderr_text, _ = clamp(stderr or "", MAX_OUTPUT_CHARS // 2)
-
-        # The reserved code means the sandbox never ran the command. Reporting
-        # that as an ordinary failure would be indistinguishable from the tests
-        # genuinely failing, and would send the debugger after a phantom bug.
-        if proc.returncode == SANDBOX_FAILED_EXIT:
-            return ExecutionResult(
-                exit_code=proc.returncode,
-                command=command,
-                duration_seconds=duration,
-                sandbox_error=(stderr_text.strip() or "the sandbox failed to run"),
-            )
-
-        return ExecutionResult(
-            exit_code=proc.returncode,
-            stdout=stdout_text,
-            stderr=stderr_text,
-            duration_seconds=duration,
-            command=command,
-        )
-
-
-_sandbox: _BaseSandbox | None = None
-
-
-def get_sandbox() -> _BaseSandbox:
-    """Process-wide sandbox, chosen by ``SE_AGENT_SANDBOX``."""
+def get_sandbox() -> Sandbox:
+    """Process-wide sandbox instance."""
     global _sandbox
     if _sandbox is None:
-        backend = (os.environ.get("SE_AGENT_SANDBOX") or "docker").strip().lower()
-        _sandbox = ScriptSandbox() if backend == "script" else DockerSandbox()
+        _sandbox = Sandbox()
     return _sandbox
 
 
 def reset_sandbox() -> None:
-    """Drop the cached instance, so a changed backend takes effect."""
+    """Drop the cached instance, so changed configuration takes effect."""
     global _sandbox
     _sandbox = None
 
 
 def sandbox_available() -> tuple[bool, str]:
-    """Preflight whichever backend is selected."""
+    """Preflight the sandbox."""
     return get_sandbox().preflight()
 
 
@@ -603,7 +496,7 @@ def sandbox_available() -> tuple[bool, str]:
 
 
 def run_command(command: str, timeout: int = 300) -> dict:
-    """Run a shell command against the repository inside a Docker sandbox.
+    """Run a shell command against the repository inside the sandbox.
 
     The command runs with no network access and no host credentials. Use it for
     builds, linters, and one-off checks; use ``run_tests`` for the test suite.
@@ -636,7 +529,7 @@ def run_command(command: str, timeout: int = 300) -> dict:
 
 
 def run_tests(command: str = "pytest -q", timeout: int = 600) -> dict:
-    """Run the project's tests inside a Docker sandbox and report real results.
+    """Run the project's tests inside the sandbox and report real results.
 
     Results are parsed from the actual process output and exit code. A suite
     that collects no tests is reported as an error, never as a pass.

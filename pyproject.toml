@@ -32,7 +32,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "integration: hits the live NVIDIA NIM API (deselect with '-m \"not integration\"')",
-    "docker: requires a working Docker daemon",
 ]
 filterwarnings = ["ignore::UserWarning"]
 

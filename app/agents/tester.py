@@ -4,7 +4,7 @@ This agent has no LLM. That is the point.
 
 A language model asked to "run the tests and report results" can produce a
 plausible-looking pass without running anything, and the failure mode is silent.
-So the tester is a deterministic ADK agent: it invokes the Docker sandbox,
+So the tester is a deterministic ADK agent: it invokes the sandbox,
 parses the actual process output, and writes a :class:`TestReport` built purely
 from the exit code and stdout. There is no path through this code by which a
 model's opinion becomes a test result.
@@ -22,7 +22,7 @@ from google.adk.events import Event, EventActions
 from google.genai import types
 
 from ..schemas import TestReport
-from ..tools.sandbox import DockerSandbox, get_sandbox
+from ..tools.sandbox import Sandbox, get_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -71,21 +71,21 @@ def _summarize(report: TestReport) -> str:
 
 
 class TesterAgent(BaseAgent):
-    """Executes the project's tests in Docker and records the real outcome."""
+    """Executes the project's tests in the sandbox and records the real outcome."""
 
-    sandbox: DockerSandbox | None = None
+    sandbox: Sandbox | None = None
 
     def __init__(self, name: str = "tester_agent", **kwargs) -> None:
         super().__init__(
             name=name,
             description=(
-                "Runs the project's test suite inside a Docker sandbox and "
+                "Runs the project's test suite inside a sandbox and "
                 "reports the real pass/fail counts and failure details."
             ),
             **kwargs,
         )
 
-    def _sandbox(self) -> DockerSandbox:
+    def _sandbox(self) -> Sandbox:
         return self.sandbox or get_sandbox()
 
     async def _save_log(self, ctx: InvocationContext, log: str) -> str:
