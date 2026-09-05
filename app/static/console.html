@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SE-Agent</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfbfa; --fg:#1a1a18; --muted:#6b6b63;
+          --line:#e2e2dc; --accent:#2f6f4f; --warn:#a33; --card:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#e8e8e3; --muted:#9a9a92; --line:#2c2c33;
+            --accent:#7fc8a0; --warn:#e08c8c; --card:#1d1d22; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+  header { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  h1 { font-size: 20px; margin: 0; letter-spacing:-0.01em; }
+  .sub { color: var(--muted); margin: 4px 0 20px; }
+  #health { font-size:12.5px; color:var(--muted); }
+  #health.ok { color:var(--accent); }
+  #health.bad { color:var(--warn); }
+  form { display: grid; gap: 10px; margin-bottom: 22px; }
+  textarea, input {
+    width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+    background:transparent; color:inherit; font:inherit;
+  }
+  textarea { min-height: 88px; resize: vertical; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  .row label { color:var(--muted); font-size:13px; }
+  button { padding:9px 18px; border:0; border-radius:8px; background:var(--accent);
+           color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  button[disabled] { opacity:.5; cursor:not-allowed; }
+  .grid { display:grid; grid-template-columns: 250px 1fr; gap:22px; align-items:start; }
+  @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+  .panel { border:1px solid var(--line); border-radius:10px; padding:14px 16px;
+           background:var(--card); }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.07em;
+              color:var(--muted); margin:0 0 10px; }
+  ol { list-style:none; margin:0; padding:0; }
+  ol li { padding:5px 0; color:var(--muted); }
+  ol li.done { color:var(--fg); }
+  ol li.active { color:var(--accent); font-weight:600; }
+  ol li.failed { color:var(--warn); }
+  #stats { margin-top:12px; padding-top:10px; border-top:1px solid var(--line);
+           color:var(--muted); font-size:12.5px; display:grid; gap:3px; }
+  .tabs { display:flex; gap:4px; margin-bottom:-1px; }
+  .tab { padding:7px 14px; border:1px solid transparent; border-radius:8px 8px 0 0;
+         color:var(--muted); cursor:pointer; font-size:13px; background:none; font-weight:500; }
+  .tab[aria-selected="true"] { color:var(--fg); background:var(--card);
+        border-color:var(--line); border-bottom-color:var(--card); }
+  .pane { border:1px solid var(--line); border-radius:0 10px 10px 10px;
+          background:var(--card); padding:14px 16px; }
+  #log { height:58vh; overflow-y:auto; font-family:ui-monospace, monospace;
+         font-size:12.5px; }
+  .e { padding:3px 0; border-bottom:1px solid var(--line); white-space:pre-wrap;
+       word-break:break-word; }
+  .e:last-child { border-bottom:0; }
+  .k { color:var(--muted); margin-right:8px; }
+  .tool .k { color:#7a7ac0; }
+  .tests .k, .review .k, .stage .k { color:var(--accent); }
+  .error, .error .k { color:var(--warn); }
+  #artifacts { height:58vh; overflow-y:auto; }
+  #artifacts .empty { color:var(--muted); }
+  details { border:1px solid var(--line); border-radius:8px; margin-bottom:8px; }
+  summary { padding:8px 12px; cursor:pointer; font-weight:600; }
+  details > div { padding:2px 12px 12px; }
+  dl { margin:0; }
+  dt { color:var(--muted); font-size:12px; text-transform:uppercase;
+       letter-spacing:.05em; margin-top:10px; }
+  dd { margin:2px 0 0; }
+  dd ul { margin:2px 0; padding-left:18px; }
+  .nested { border-left:2px solid var(--line); padding-left:10px; margin:6px 0; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:99px; font-size:11.5px;
+           font-weight:600; border:1px solid var(--line); }
+  .badge.good { color:var(--accent); border-color:currentColor; }
+  .badge.bad { color:var(--warn); border-color:currentColor; }
+  #banner { margin-bottom:16px; padding:12px 16px; border-radius:10px;
+            border:1px solid var(--line); font-weight:600; }
+  #banner.good { color:var(--accent); }
+  #banner.bad { color:var(--warn); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>SE-Agent</h1>
+    <span id="health">checking...</span>
+  </header>
+  <p class="sub">Requirements to reviewed change, with tests actually run in Docker.</p>
+
+  <form id="f">
+    <textarea id="req" placeholder="Describe the change you want..."></textarea>
+    <div class="row">
+      <input id="repo" placeholder="repository path (optional)" style="flex:1;min-width:200px">
+      <label>iterations
+        <input id="iters" type="number" value="3" min="1" max="5" style="width:60px">
+      </label>
+      <input id="token" type="password" placeholder="API token (if set)" style="width:170px">
+      <button id="go" type="submit">Run</button>
+    </div>
+  </form>
+
+  <div id="banner" hidden></div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Progress</h2>
+      <ol id="phases"></ol>
+      <div id="stats">
+        <div>iteration <span id="iter">0</span></div>
+        <div><span id="tools">0</span> tool calls</div>
+        <div>elapsed <span id="clock">0:00</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true" data-pane="log">Activity</button>
+        <button class="tab" role="tab" aria-selected="false" data-pane="artifacts">Artifacts</button>
+      </div>
+      <div class="pane">
+        <div id="log"></div>
+        <div id="artifacts" hidden><p class="empty">Stage output appears here as each agent finishes.</p></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const log = $('log'), artifacts = $('artifacts'), phasesEl = $('phases');
+let phases = [], current = null, done = new Set(), failed = new Set();
+let started = 0, ticker = null;
+
+// ------------------------------------------------------------------ chrome
+
+fetch('/api/phases').then(r => r.json()).then(d => { phases = d.phases; renderPhases(); });
+
+fetch('/api/health').then(r => r.json()).then(d => {
+  const el = $('health');
+  el.className = d.ready ? 'ok' : 'bad';
+  el.textContent = d.ready ? '● ready' : '✗ ' + d.problems.join('; ');
+  $('go').disabled = !d.ready;
+}).catch(() => { $('health').textContent = ''; });
+
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.addEventListener('click', () => {
+    for (const t of document.querySelectorAll('.tab')) {
+      const on = t === tab;
+      t.setAttribute('aria-selected', String(on));
+      $(t.dataset.pane).hidden = !on;
+    }
+  });
+}
+
+function renderPhases() {
+  phasesEl.innerHTML = phases.map(p => {
+    const cls = failed.has(p.id) ? 'failed'
+              : p.id === current ? 'active'
+              : done.has(p.id) ? 'done' : '';
+    const mark = failed.has(p.id) ? '✗'
+               : p.id === current ? '›'
+               : done.has(p.id) ? '✓' : '·';
+    return `<li class="${cls}">${mark} ${esc(p.label)}</li>`;
+  }).join('');
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function add(kind, text) {
+  const el = document.createElement('div');
+  el.className = 'e ' + kind;
+  el.innerHTML = `<span class="k">${esc(kind)}</span>${esc(text)}`;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+function tick() {
+  const s = Math.floor((Date.now() - started) / 1000);
+  $('clock').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// --------------------------------------------------------------- artifacts
+
+// One recursive renderer for every schema: they are all dicts of scalars,
+// lists and nested models, so per-stage renderers would be seven copies of this.
+function render(value) {
+  if (value === null || value === undefined || value === '') return '';
+  if (Array.isArray(value)) {
+    if (!value.length) return '';
+    return '<ul>' + value.map(v => `<li>${render(v)}</li>`).join('') + '</ul>';
+  }
+  if (typeof value === 'object') {
+    const rows = Object.entries(value)
+      .map(([k, v]) => [k, render(v)])
+      .filter(([, html]) => html !== '');
+    if (!rows.length) return '';
+    return '<div class="nested"><dl>' + rows.map(
+      ([k, html]) => `<dt>${esc(k.replace(/_/g, ' '))}</dt><dd>${html}</dd>`
+    ).join('') + '</dl></div>';
+  }
+  if (typeof value === 'boolean') return badge(value ? 'yes' : 'no', value);
+  const text = String(value);
+  return /^(approved|passed|success)/i.test(text) ? badge(text, true)
+       : /^(changes_required|rejected|failed|critical|high)/i.test(text) ? badge(text, false)
+       : esc(text);
+}
+
+function badge(text, good) {
+  return `<span class="badge ${good ? 'good' : 'bad'}">${esc(text)}</span>`;
+}
+
+function stage(key, label, value) {
+  artifacts.querySelector('.empty')?.remove();
+  let card = document.getElementById('a-' + key);
+  if (!card) {
+    card = document.createElement('details');
+    card.id = 'a-' + key;
+    artifacts.appendChild(card);
+  }
+  // Later iterations replace the card, so the panel shows the current truth.
+  card.innerHTML = `<summary>${esc(label)}</summary><div>${render(value) || '<p>(empty)</p>'}</div>`;
+}
+
+// -------------------------------------------------------------------- run
+
+$('f').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const btn = $('go');
+  btn.disabled = true;
+  log.innerHTML = '';
+  artifacts.innerHTML = '<p class="empty">Stage output appears here as each agent finishes.</p>';
+  done = new Set(); failed = new Set(); current = null; renderPhases();
+  $('banner').hidden = true; $('iter').textContent = '0'; $('tools').textContent = '0';
+  started = Date.now(); clearInterval(ticker); ticker = setInterval(tick, 1000); tick();
+
+  const headers = {'Content-Type': 'application/json'};
+  const token = $('token').value.trim();
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        request: $('req').value,
+        repo: $('repo').value || null,
+        max_iterations: Number($('iters').value)
+      })
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      add('error', `${res.status}: ${detail}`);
+      return;
+    }
+    await consume(res.body.getReader());
+  } catch (err) {
+    add('error', String(err));
+  } finally {
+    clearInterval(ticker);
+    btn.disabled = false;
+  }
+});
+
+async function consume(reader) {
+  const decoder = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const {value, done: fin} = await reader.read();
+    if (fin) break;
+    buf += decoder.decode(value, {stream: true});
+    const chunks = buf.split('\n\n');
+    buf = chunks.pop();
+    for (const chunk of chunks) {
+      const name = /^event: (.*)$/m.exec(chunk);
+      const data = /^data: ([\s\S]*)$/m.exec(chunk);
+      if (!name || !data) continue;
+      let d; try { d = JSON.parse(data[1]); } catch { continue; }
+      handle(name[1], d);
+    }
+  }
+}
+
+function handle(kind, d) {
+  if (typeof d.iteration === 'number' && d.iteration) $('iter').textContent = d.iteration;
+  if (kind === 'tool') $('tools').textContent = Number($('tools').textContent) + 1;
+
+  if (kind === 'phase') {
+    if (current) done.add(current);
+    current = d.phase; renderPhases();
+    add('phase', d.text);
+  } else if (kind === 'stage') {
+    stage(d.data.key, d.text, d.data.value);
+    add('stage', d.text + ' ready');
+  } else if (kind === 'tests') {
+    stage('tests', 'Test report', d.data);
+    add('tests', d.text);
+  } else if (kind === 'review') {
+    stage('review', 'Code review', d.data);
+    add('review', d.text);
+  } else if (kind === 'error') {
+    if (current) failed.add(current);
+    renderPhases();
+    add('error', d.text);
+  } else if (kind === 'result') {
+    finish(d);
+  } else {
+    add(kind, d.text || '');
+  }
+}
+
+function finish(d) {
+  if (current) done.add(current);
+  current = null; renderPhases();
+  clearInterval(ticker);
+  $('iter').textContent = d.iterations || 0;
+  if (typeof d.tool_calls === 'number') $('tools').textContent = d.tool_calls;
+
+  const banner = $('banner');
+  banner.hidden = false;
+  banner.className = d.succeeded ? 'good' : 'bad';
+  banner.textContent = (d.succeeded ? '✓ Succeeded' : '✗ Did not succeed')
+    + ` — tests ${d.tests_passed ? 'passed' : 'not passing'}, `
+    + `review ${d.review_approved ? 'approved' : 'not approved'}, `
+    + `${d.iterations} iteration(s), ${d.tool_calls} tool call(s)`;
+
+  if (d.report) stage('report', 'Final report', d.report);
+  for (const e of d.errors || []) add('error', e);
+  add('result', banner.textContent);
+}
+</script>
+</body>
+</html>

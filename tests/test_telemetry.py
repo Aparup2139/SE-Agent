@@ -194,3 +194,36 @@ def test_long_tool_args_are_truncated():
 def test_empty_args_render_empty():
     assert _brief_args({}) == ""
     assert _brief_args(None) == ""
+
+
+# ------------------------------------------------------------------- stages
+
+
+def test_structured_stage_output_is_surfaced_for_the_ui():
+    tracker = RunTracker()
+    updates = tracker.observe(
+        event(state_delta={"requirements": {"summary": "add a thing"}})
+    )
+    stage = [u for u in updates if u.kind == "stage"]
+    assert len(stage) == 1
+    assert stage[0].text == "Requirements"
+    assert stage[0].phase is Phase.REQUIREMENTS
+    assert stage[0].data == {
+        "key": "requirements",
+        "value": {"summary": "add a thing"},
+    }
+
+
+def test_tests_and_review_are_not_duplicated_as_stages():
+    """They already have their own kinds; sending both doubles the payload."""
+    tracker = RunTracker()
+    updates = tracker.observe(
+        event(state_delta={"tests": {"passed": 1}, "review": {"verdict": "approved"}})
+    )
+    assert [u.kind for u in updates] == ["tests", "review"]
+
+
+def test_an_empty_or_non_dict_stage_value_is_ignored():
+    tracker = RunTracker()
+    assert tracker.observe(event(state_delta={"plan": {}})) == []
+    assert tracker.observe(event(state_delta={"plan": "oops"})) == []

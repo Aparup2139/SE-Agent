@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .agent import RunResult, preflight, stream_run
@@ -215,169 +215,10 @@ async def run(
     )
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> str:
-    """A minimal console, so the server is usable without a build step."""
-    return _CONSOLE_HTML
+CONSOLE = Path(__file__).parent / "static" / "console.html"
 
 
-_CONSOLE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SE-Agent</title>
-<style>
-  :root { color-scheme: light dark; --bg:#fbfbfa; --fg:#1a1a18; --muted:#6b6b63;
-          --line:#e2e2dc; --accent:#2f6f4f; --warn:#a33; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#16161a; --fg:#e8e8e3; --muted:#9a9a92; --line:#2c2c33;
-            --accent:#7fc8a0; --warn:#e08c8c; }
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:14px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 20px 64px; }
-  h1 { font-size: 20px; margin: 0 0 4px; letter-spacing:-0.01em; }
-  .sub { color: var(--muted); margin: 0 0 28px; }
-  form { display: grid; gap: 12px; margin-bottom: 28px; }
-  textarea, input {
-    width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
-    background:transparent; color:inherit; font:inherit;
-  }
-  textarea { min-height: 92px; resize: vertical; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
-  .row label { color:var(--muted); font-size:13px; }
-  button { padding:9px 18px; border:0; border-radius:8px; background:var(--accent);
-           color:#fff; font:inherit; font-weight:600; cursor:pointer; }
-  button[disabled] { opacity:.5; cursor:not-allowed; }
-  .grid { display:grid; grid-template-columns: 260px 1fr; gap:24px; }
-  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
-  .panel { border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
-  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.07em;
-              color:var(--muted); margin:0 0 10px; }
-  ol { list-style:none; margin:0; padding:0; }
-  ol li { padding:5px 0; color:var(--muted); }
-  ol li.done { color:var(--fg); }
-  ol li.active { color:var(--accent); font-weight:600; }
-  #log { height:60vh; overflow-y:auto; font-family:ui-monospace, monospace;
-         font-size:12.5px; }
-  .e { padding:3px 0; border-bottom:1px solid var(--line); white-space:pre-wrap;
-       word-break:break-word; }
-  .e:last-child { border-bottom:0; }
-  .k { color:var(--muted); margin-right:8px; }
-  .tool .k { color:#7a7ac0; }
-  .tests .k, .review .k { color:var(--accent); }
-  .error { color:var(--warn); }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>SE-Agent</h1>
-  <p class="sub">Requirements to reviewed change, with tests actually run in Docker.</p>
-
-  <form id="f">
-    <textarea id="req" placeholder="Describe the change you want..."></textarea>
-    <div class="row">
-      <input id="repo" placeholder="repository path (optional)" style="flex:1;min-width:220px">
-      <label>iterations
-        <input id="iters" type="number" value="3" min="1" max="10" style="width:64px">
-      </label>
-      <button id="go" type="submit">Run</button>
-    </div>
-  </form>
-
-  <div class="grid">
-    <div class="panel">
-      <h2>Progress</h2>
-      <ol id="phases"></ol>
-    </div>
-    <div class="panel">
-      <h2>Activity</h2>
-      <div id="log"></div>
-    </div>
-  </div>
-</div>
-<script>
-const log = document.getElementById('log');
-const phasesEl = document.getElementById('phases');
-let phases = [], current = null, done = new Set();
-
-fetch('/api/phases').then(r => r.json()).then(d => { phases = d.phases; renderPhases(); });
-
-function renderPhases() {
-  phasesEl.innerHTML = phases.map(p => {
-    const cls = p.id === current ? 'active' : (done.has(p.id) ? 'done' : '');
-    const mark = p.id === current ? '>' : (done.has(p.id) ? '\\u2713' : '\\u00b7');
-    return `<li class="${cls}">${mark} ${p.label}</li>`;
-  }).join('');
-}
-
-function add(kind, text) {
-  const el = document.createElement('div');
-  el.className = 'e ' + kind;
-  el.innerHTML = `<span class="k">${kind}</span>${escapeHtml(text)}`;
-  log.appendChild(el);
-  log.scrollTop = log.scrollHeight;
-}
-function escapeHtml(s) {
-  return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-}
-
-document.getElementById('f').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const btn = document.getElementById('go');
-  btn.disabled = true;
-  log.innerHTML = ''; done = new Set(); current = null; renderPhases();
-
-  const res = await fetch('/api/run', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      request: document.getElementById('req').value,
-      repo: document.getElementById('repo').value || null,
-      max_iterations: Number(document.getElementById('iters').value)
-    })
-  });
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = '';
-  while (true) {
-    const {value, done: fin} = await reader.read();
-    if (fin) break;
-    buf += decoder.decode(value, {stream: true});
-    const chunks = buf.split('\\n\\n');
-    buf = chunks.pop();
-    for (const chunk of chunks) {
-      const ev = /event: (.*)/.exec(chunk);
-      const dt = /data: ([\\s\\S]*)/.exec(chunk);
-      if (!ev || !dt) continue;
-      let d; try { d = JSON.parse(dt[1]); } catch { continue; }
-      handle(ev[1], d);
-    }
-  }
-  btn.disabled = false;
-});
-
-function handle(kind, d) {
-  if (kind === 'phase') {
-    if (current) done.add(current);
-    current = d.phase; renderPhases();
-    add('phase', d.text);
-  } else if (kind === 'result') {
-    if (current) done.add(current);
-    current = null; renderPhases();
-    add('result', `${d.succeeded ? 'SUCCEEDED' : 'DID NOT SUCCEED'} - tests ` +
-      `${d.tests_passed ? 'passed' : 'not passing'}, review ` +
-      `${d.review_approved ? 'approved' : 'not approved'}, ` +
-      `${d.iterations} iteration(s), ${d.tool_calls} tool call(s)`);
-    if (d.report) add('report', d.report.summary || '');
-  } else {
-    add(kind, d.text || '');
-  }
-}
-</script>
-</body>
-</html>
-"""
+@app.get("/")
+async def index() -> FileResponse:
+    """A single-file console, so the server is usable without a build step."""
+    return FileResponse(CONSOLE, media_type="text/html")

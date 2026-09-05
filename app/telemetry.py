@@ -59,6 +59,18 @@ PHASE_LABELS = {
 }
 
 
+# Structured state a run produces, in the order it lands. ``tests`` and
+# ``review`` are absent: they already have their own update kinds.
+STAGE_KEYS: dict[str, tuple[Phase, str]] = {
+    "requirements": (Phase.REQUIREMENTS, "Requirements"),
+    "repository": (Phase.ANALYSIS, "Repository analysis"),
+    "risks": (Phase.ANALYSIS, "Risk analysis"),
+    "architecture": (Phase.ARCHITECTURE, "Architecture"),
+    "plan": (Phase.PLANNING, "Implementation plan"),
+    "report": (Phase.FINAL, "Final report"),
+}
+
+
 @dataclass
 class Update:
     """One thing worth telling the user about."""
@@ -174,6 +186,19 @@ class RunTracker:
                 self.iteration = int(delta["iteration"])
             except (TypeError, ValueError):
                 pass
+
+        for key, (phase, label) in STAGE_KEYS.items():
+            value = delta.get(key)
+            if isinstance(value, dict) and value:
+                updates.append(
+                    Update(
+                        kind="stage",
+                        text=label,
+                        phase=phase,
+                        iteration=self.iteration,
+                        data={"key": key, "value": value},
+                    )
+                )
 
         if "tests" in delta:
             tests = delta["tests"] or {}

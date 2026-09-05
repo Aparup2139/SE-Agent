@@ -240,3 +240,27 @@ def test_traversal_out_of_the_root_is_refused(tmp_path, monkeypatch):
 def test_no_repo_means_the_servers_own_directory(monkeypatch):
     monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
     assert server.resolve_repo(None) is None
+
+
+def test_the_console_is_a_real_file_not_a_python_string():
+    """Escaping HTML inside a Python literal has bitten this project once."""
+    assert server.CONSOLE.is_file()
+    assert "<title>SE-Agent</title>" in server.CONSOLE.read_text(encoding="utf-8")
+
+
+def test_stage_payloads_reach_the_wire_intact(client, monkeypatch):
+    """The artifacts panel is only as good as the data the stream carries."""
+    monkeypatch.setattr(server, "preflight", lambda repo=None: [])
+
+    async def fake_stream(request, repo=None, limit=None, user_id=None):
+        yield Update(
+            kind="stage",
+            text="Requirements",
+            phase=Phase.REQUIREMENTS,
+            data={"key": "requirements", "value": {"summary": "add a thing"}},
+        )
+
+    monkeypatch.setattr(server, "stream_run", fake_stream)
+    name, payload = parse_sse(client.post("/api/run", json={"request": "x"}).text)[0]
+    assert name == "stage"
+    assert payload["data"]["value"]["summary"] == "add a thing"
