@@ -87,7 +87,7 @@ def test_trailing_slash_is_normalized():
 def test_malformed_numeric_env_falls_back_to_default(clean_env):
     clean_env.setenv("NVIDIA_API_KEY", "nvapi-test")
     clean_env.setenv("NVIDIA_TIMEOUT", "not-a-number")
-    assert get_config().timeout == 120.0
+    assert get_config().timeout == 300.0
 
 
 def test_retries_are_bounded():

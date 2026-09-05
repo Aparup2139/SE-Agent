@@ -24,6 +24,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.models.registry import LLMRegistry
 from google.genai import types
+from pydantic import BaseModel
 
 from .config import DEFAULT_MODEL
 from .nvidia_kimi import Completion, NVIDIAError, NVIDIAKimiClient, get_client
@@ -42,18 +43,36 @@ _FINISH_REASONS = {
 # --------------------------------------------------------------------- schema
 
 
-def _schema_to_json(schema: types.Schema | dict[str, Any] | None) -> dict[str, Any]:
-    """Convert a genai ``Schema`` into a plain JSON Schema dict.
+def _schema_to_json(schema: Any) -> dict[str, Any]:
+    """Convert whatever ADK hands us into a plain JSON Schema dict.
 
-    genai spells types in upper case (``"OBJECT"``); JSON Schema and the OpenAI
-    function-calling format want lower case.
+    Four shapes turn up in practice: ``None``, an already-plain dict, a genai
+    ``Schema`` instance (from a tool's function declaration), and a Pydantic
+    model *class* (from ``LlmAgent(output_schema=...)``, which ADK passes as the
+    type itself rather than an instance).
+
+    genai also spells types in upper case (``"OBJECT"``); JSON Schema and the
+    OpenAI function-calling format want lower case.
     """
     if schema is None:
         return {"type": "object", "properties": {}}
+
     if isinstance(schema, dict):
         raw = schema
-    else:
+    elif isinstance(schema, type) and issubclass(schema, BaseModel):
+        # A Pydantic model class: ask Pydantic for the schema directly.
+        raw = schema.model_json_schema()
+    elif isinstance(schema, BaseModel):
         raw = schema.model_dump(exclude_none=True, by_alias=True)
+    else:
+        # Anything else with a dict-like dump (a genai Schema, typically).
+        dump = getattr(schema, "model_dump", None)
+        if callable(dump):
+            raw = dump(exclude_none=True, by_alias=True)
+        else:
+            logger.warning("unrecognized schema type %r; sending an open object", type(schema))
+            return {"type": "object", "properties": {}}
+
     return _normalize_schema(raw)
 
 

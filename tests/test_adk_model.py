@@ -318,3 +318,37 @@ async def test_provider_failure_becomes_error_response(monkeypatch):
     responses = [r async for r in model.generate_content_async(request)]
     assert responses[0].error_code == "NVIDIAAuthError"
     assert "bad key" in responses[0].error_message
+
+
+# ---------------------------------------------- output_schema as a model class
+
+
+def test_pydantic_model_class_is_accepted_as_a_response_schema():
+    """ADK passes LlmAgent(output_schema=Model) as the class, not an instance."""
+    from app.schemas import Requirements
+
+    result = _schema_to_json(Requirements)
+    assert result["type"] == "object"
+    assert "summary" in result["properties"]
+
+
+def test_response_format_built_from_a_model_class():
+    from app.schemas import Requirements
+
+    config = types.GenerateContentConfig(response_schema=Requirements)
+    fmt = _response_format(config)
+    assert fmt["type"] == "json_schema"
+    assert "summary" in fmt["json_schema"]["schema"]["properties"]
+
+
+def test_nested_model_refs_survive_conversion():
+    """Requirements nests AcceptanceCriterion, so $defs/$ref must be preserved."""
+    from app.schemas import Requirements
+
+    result = _schema_to_json(Requirements)
+    assert "$defs" in result
+    assert "AcceptanceCriterion" in result["$defs"]
+
+
+def test_unrecognized_schema_degrades_to_an_open_object():
+    assert _schema_to_json(object()) == {"type": "object", "properties": {}}

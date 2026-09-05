@@ -33,8 +33,8 @@ class NVIDIAConfig(BaseModel):
     api_key: str = Field(repr=False)
     model: str = DEFAULT_MODEL
     base_url: str = DEFAULT_BASE_URL
-    timeout: float = 120.0
-    max_retries: int = 3
+    timeout: float = 300.0
+    max_retries: int = 5
     max_tokens: int = 16384
     temperature: float = 1.0
     seed: int = 0
@@ -119,8 +119,8 @@ def get_config() -> NVIDIAConfig:
         api_key=api_key,
         model=os.environ.get("NVIDIA_MODEL") or DEFAULT_MODEL,
         base_url=os.environ.get("NVIDIA_BASE_URL") or DEFAULT_BASE_URL,
-        timeout=_float("NVIDIA_TIMEOUT", 120.0),
-        max_retries=_int("NVIDIA_MAX_RETRIES", 3),
+        timeout=_float("NVIDIA_TIMEOUT", 300.0),
+        max_retries=_int("NVIDIA_MAX_RETRIES", 5),
         max_tokens=_int("NVIDIA_MAX_TOKENS", 16384),
         temperature=_float("NVIDIA_TEMPERATURE", 1.0),
         seed=_int("NVIDIA_SEED", 0),
