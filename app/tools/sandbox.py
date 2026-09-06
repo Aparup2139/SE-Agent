@@ -142,6 +142,46 @@ def allow_unsafe() -> bool:
     }
 
 
+def find_bash() -> str:
+    """Locate a *native* bash.
+
+    On Windows the ``bash`` on PATH is often ``C:/Windows/System32/bash.exe``,
+    which is not a shell at all -- it is the WSL launcher. Handing it a Windows
+    path fails with a confusing ``execvpe(/bin/bash)`` error, and it silently
+    changes which OS the command would have run on. PowerShell resolves to that
+    shim while Git Bash resolves to its own, which is how the same code worked
+    in one shell and not the other.
+    """
+    candidates: list[str] = []
+
+    found = shutil.which("bash")
+    if found and "system32" not in found.replace("\\", "/").lower():
+        candidates.append(found)
+
+    if os.name == "nt":
+        git_bash = os.path.join("Git", "bin", "bash.exe")
+        candidates += [
+            os.path.join(r"C:\Program Files", git_bash),
+            os.path.join(r"C:\Program Files (x86)", git_bash),
+            os.path.join(os.path.expandvars(r"%LOCALAPPDATA%\Programs"), git_bash),
+        ]
+
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+
+    detail = (
+        "the `bash` on PATH is the WSL launcher, not a shell"
+        if found
+        else "no bash is on PATH"
+    )
+    raise SandboxError(
+        f"no native bash was found to run the sandbox script ({detail}). "
+        "Install Git Bash, or set SE_AGENT_SANDBOX_WSL=<distro> to run inside "
+        "WSL deliberately."
+    )
+
+
 @dataclass
 class SandboxConfig:
     script: str = ""
@@ -209,13 +249,7 @@ class Sandbox:
         """The argv prefix that gets us a shell on the target OS."""
         if self.uses_wsl:
             return ["wsl.exe", "-d", self.config.wsl_distro, "--", "env"]
-        shell = shutil.which("bash")
-        if shell is None:
-            raise SandboxError(
-                "bash is required to run the sandbox script and is not on PATH "
-                "(install Git Bash, or set SE_AGENT_SANDBOX_WSL to use WSL)"
-            )
-        return [shell]
+        return [find_bash()]
 
     def tier(self) -> str:
         """Which isolation tier is actually in force. Cached per instance."""

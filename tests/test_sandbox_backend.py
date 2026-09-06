@@ -326,3 +326,27 @@ def test_timeout_is_reported_as_a_sandbox_error(ready_box, monkeypatch):
     report = ready_box.run_tests("pytest -q", timeout=1)
     assert not report.is_green
     assert not report.ran, "a timeout must never look like a test result"
+
+
+# ---------------------------------------------------------------- finding bash
+
+
+def test_the_wsl_shim_is_not_mistaken_for_a_shell(monkeypatch):
+    """`bash` on PATH in PowerShell is C:/Windows/System32/bash.exe -- the WSL
+    launcher. Using it silently changes which OS the command runs on, and fails
+    confusingly when handed a Windows path."""
+    monkeypatch.setattr(
+        sandbox_module.shutil, "which", lambda name: r"C:\Windows\System32\bash.exe"
+    )
+    monkeypatch.setattr(sandbox_module.Path, "is_file", lambda self: False)
+
+    with pytest.raises(sandbox_module.SandboxError) as exc:
+        sandbox_module.find_bash()
+    assert "WSL launcher" in str(exc.value)
+
+
+def test_a_real_bash_on_path_is_used(monkeypatch, tmp_path):
+    shell = tmp_path / "bash.exe"
+    shell.write_text("", encoding="utf-8")
+    monkeypatch.setattr(sandbox_module.shutil, "which", lambda name: str(shell))
+    assert sandbox_module.find_bash() == str(shell)
