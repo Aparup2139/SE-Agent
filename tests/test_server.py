@@ -100,7 +100,7 @@ def test_updates_and_result_are_streamed(client, monkeypatch):
     tracker = RunTracker()
     tracker.tool_calls = 4
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
         yield Update(kind="tool", text="read_file(path=a.py)", phase=Phase.ANALYSIS)
         yield Update(kind="tests", text="6 passed, 0 failed", phase=Phase.TESTING)
@@ -127,7 +127,7 @@ def test_updates_and_result_are_streamed(client, monkeypatch):
 def test_a_failed_run_is_reported_as_not_succeeded(client, monkeypatch):
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield RunResult(
             session_id="run-x",
             state={"tests_passed": True, "review_approved": False},
@@ -144,7 +144,7 @@ def test_a_failed_run_is_reported_as_not_succeeded(client, monkeypatch):
 def test_a_crash_mid_stream_becomes_an_error_event(client, monkeypatch):
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
         raise RuntimeError("provider exploded")
 
@@ -162,7 +162,7 @@ def test_a_token_free_server_serves_loopback(client, monkeypatch):
     monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
 
     monkeypatch.setattr(server, "stream_run", fake_stream)
@@ -188,7 +188,7 @@ def test_the_right_token_is_accepted(client, monkeypatch):
     monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield Update(kind="phase", text="Requirements", phase=Phase.REQUIREMENTS)
 
     monkeypatch.setattr(server, "stream_run", fake_stream)
@@ -200,11 +200,16 @@ def test_the_right_token_is_accepted(client, monkeypatch):
     assert response.status_code == 200
 
 
-def test_choosing_a_repo_is_refused_without_a_configured_root(client, monkeypatch):
-    """An HTTP caller must not pick an arbitrary host path for a writing agent."""
+def test_choosing_a_repo_is_refused_without_a_configured_root(monkeypatch):
+    """A remote caller must not pick an arbitrary host path for a writing agent."""
     monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
-    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
-    response = client.post("/api/run", json={"request": "x", "repo": "C:/Windows"})
+    monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
+    remote = TestClient(server.app, client=("203.0.113.9", 40000))
+    response = remote.post(
+        "/api/run",
+        json={"request": "x", "repo": "C:/Windows"},
+        headers={"Authorization": "Bearer correct-token"},
+    )
     assert response.status_code == 403
     assert "SE_AGENT_REPO_ROOT" in response.json()["detail"]
 
@@ -254,7 +259,7 @@ def test_stage_payloads_reach_the_wire_intact(client, monkeypatch):
     """The artifacts panel is only as good as the data the stream carries."""
     monkeypatch.setattr(server, "preflight", lambda repo=None: [])
 
-    async def fake_stream(request, repo=None, limit=None, user_id=None):
+    async def fake_stream(request, repo=None, limit=None, mode=None, user_id=None):
         yield Update(
             kind="stage",
             text="Requirements",
@@ -266,3 +271,78 @@ def test_stage_payloads_reach_the_wire_intact(client, monkeypatch):
     name, payload = parse_sse(client.post("/api/run", json={"request": "x"}).text)[0]
     assert name == "stage"
     assert payload["data"]["value"]["summary"] == "add a thing"
+
+
+def test_dirs_lists_subdirectories_of_the_configured_root(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_REPO_ROOT", str(tmp_path))
+    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
+    (tmp_path / "project" / "app").mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    root = str(tmp_path.resolve())
+
+    top = client.get("/api/dirs").json()
+    assert top["path"] == root
+    assert top["up"] is None  # a confined caller cannot climb past the root
+    assert [e["label"] for e in top["entries"]] == ["project"]
+
+    nested = client.get("/api/dirs", params={"path": "project"}).json()
+    assert nested["up"] == root
+    assert [e["label"] for e in nested["entries"]] == ["app"]
+
+
+def test_dirs_refuses_to_browse_outside_the_root(client, tmp_path, monkeypatch):
+    monkeypatch.setenv("SE_AGENT_REPO_ROOT", str(tmp_path / "allowed"))
+    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
+    (tmp_path / "allowed").mkdir()
+    assert client.get("/api/dirs", params={"path": "../.."}).status_code == 403
+
+
+def test_dirs_browses_the_whole_machine_for_a_local_caller(client, tmp_path, monkeypatch):
+    """With no root configured, the local user has the reach the CLI has."""
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    monkeypatch.delenv("SE_AGENT_API_TOKEN", raising=False)
+    (tmp_path / "somewhere").mkdir()
+
+    top = client.get("/api/dirs").json()
+    assert top["path"] == ""  # the drive list: no directory selected yet
+    assert top["up"] is None
+
+    listing = client.get("/api/dirs", params={"path": str(tmp_path)}).json()
+    assert [e["label"] for e in listing["entries"]] == ["somewhere"]
+    assert listing["up"] == str(tmp_path.resolve().parent)
+
+
+def test_an_absolute_path_is_refused_from_off_the_machine(monkeypatch, tmp_path):
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    with _pytest.raises(HTTPException) as exc:
+        server.resolve_repo(str(tmp_path), local=False)
+    assert exc.value.status_code == 403
+
+
+def test_a_local_caller_may_choose_any_directory(monkeypatch, tmp_path):
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    assert server.resolve_repo(str(tmp_path), local=True) == str(tmp_path.resolve())
+
+
+def test_a_local_caller_still_cannot_choose_a_non_directory(monkeypatch, tmp_path):
+    import pytest as _pytest
+    from fastapi import HTTPException
+
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    target = tmp_path / "file.txt"
+    target.write_text("x", encoding="utf-8")
+    with _pytest.raises(HTTPException) as exc:
+        server.resolve_repo(str(target), local=True)
+    assert exc.value.status_code == 400
+
+
+def test_dirs_refuses_to_list_the_machine_from_off_it(monkeypatch):
+    """Drive names are not something to hand the network either."""
+    monkeypatch.delenv("SE_AGENT_REPO_ROOT", raising=False)
+    monkeypatch.setenv("SE_AGENT_API_TOKEN", "correct-token")
+    remote = TestClient(server.app, client=("203.0.113.9", 40000))
+    response = remote.get("/api/dirs", headers={"Authorization": "Bearer correct-token"})
+    assert response.status_code == 403

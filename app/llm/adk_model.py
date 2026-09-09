@@ -27,7 +27,21 @@ from google.genai import types
 from pydantic import BaseModel
 
 from .config import DEFAULT_MODEL
-from .nvidia_kimi import Completion, NVIDIAError, NVIDIAKimiClient, get_client
+from .nvidia_kimi import Completion, NVIDIAError, NVIDIAKimiClient, ToolCall, get_client
+
+MAX_STRUCTURED_OUTPUT_RETRIES = 2
+
+
+class StructuredOutputError(RuntimeError):
+    """The model never called ``set_model_response`` despite being nudged.
+
+    ADK's own validation for a plain-text final response has no retry and
+    crashes the whole run (``llm_agent.py``'s unguarded
+    ``__maybe_save_output_to_state`` vs. ``set_model_response_tool.py``'s
+    catch-and-retry). Raising this instead lets the caller report a
+    recoverable agent error rather than an uncaught crash.
+    """
+
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +107,7 @@ def _normalize_schema(node: Any) -> Any:
         elif key == "ref":
             out["$ref"] = value
         elif key in ("items", "any_of", "anyOf"):
-            out["anyOf" if key in ("any_of", "anyOf") else "items"] = _normalize_schema(
-                value
-            )
+            out["anyOf" if key in ("any_of", "anyOf") else "items"] = _normalize_schema(value)
         else:
             out[key] = _normalize_schema(value)
     return out
@@ -120,8 +132,7 @@ def _tools_to_openai(config: types.GenerateContentConfig) -> list[dict[str, Any]
                     "function": {
                         "name": declaration.name,
                         "description": declaration.description or "",
-                        "parameters": parameters
-                        or {"type": "object", "properties": {}},
+                        "parameters": parameters or {"type": "object", "properties": {}},
                     },
                 }
             )
@@ -251,9 +262,7 @@ def _completion_to_parts(completion: Completion) -> list[types.Part]:
     for call in completion.tool_calls:
         parts.append(
             types.Part(
-                function_call=types.FunctionCall(
-                    id=call.id, name=call.name, args=call.arguments
-                )
+                function_call=types.FunctionCall(id=call.id, name=call.name, args=call.arguments)
             )
         )
     return parts
@@ -269,6 +278,82 @@ def _usage(completion: Completion) -> types.GenerateContentResponseUsageMetadata
     )
 
 
+# ------------------------------------------------------- tool-call recovery
+
+# Wrapper keys a model uses when it describes a call instead of making one.
+_CALL_NAME_KEYS = ("name", "tool", "tool_name", "function")
+_CALL_ARGS_KEYS = ("arguments", "args", "parameters", "input")
+
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    """The first complete JSON object in ``text``, fences and prose ignored."""
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _schema_fields(tools: list[dict[str, Any]], name: str) -> set[str]:
+    """The declared parameter names of one tool, for recognizing its payload."""
+    for tool in tools:
+        function = tool.get("function") or {}
+        if function.get("name") == name:
+            properties = (function.get("parameters") or {}).get("properties") or {}
+            return set(properties)
+    return set()
+
+
+def _recover_tool_call(text: str, name: str, fields: set[str] | None = None) -> ToolCall | None:
+    """Read a tool call out of a model turn that answered in text instead.
+
+    A small model routinely emits the *right* payload in the wrong channel:
+    as JSON in ``content`` rather than as a ``tool_calls`` entry. Re-asking
+    does not help -- the model already believes it complied -- so the answer
+    is recovered here. Two shapes are accepted: a wrapper naming the tool
+    (``{"tool": "set_model_response", "arguments": {...}}``, and the
+    ``name``/``function``/``args`` spellings of it) and the bare argument
+    object itself.
+    """
+    payload = _first_json_object(text or "")
+    if payload is None:
+        return None
+
+    called = next((payload[key] for key in _CALL_NAME_KEYS if key in payload), None)
+    if isinstance(called, dict):  # {"function": {"name": ..., "arguments": ...}}
+        payload, called = called, called.get("name")
+
+    if called is not None:
+        if called != name:
+            return None
+        arguments = next((payload[key] for key in _CALL_ARGS_KEYS if key in payload), None)
+    else:
+        # No wrapper: the object may be the argument payload itself. Only
+        # believe that if it actually looks like this tool's payload --
+        # otherwise any stray JSON in an answer would become a fake call.
+        if fields and not (set(payload) & fields):
+            return None
+        arguments = payload
+
+    if isinstance(arguments, str):  # arguments sometimes arrive re-encoded
+        arguments = _first_json_object(arguments)
+    if not isinstance(arguments, dict) or not arguments:
+        return None
+
+    logger.warning(
+        "recovered a %s call from a plain-text answer; the model described "
+        "the call instead of making it",
+        name,
+    )
+    return ToolCall(id=f"recovered-{name}", name=name, arguments=arguments)
+
+
 # --------------------------------------------------------------------- model
 
 
@@ -279,8 +364,20 @@ class KimiK3Llm(BaseLlm):
 
     @staticmethod
     def supported_models() -> list[str]:
-        """Regexes ADK's registry matches agent ``model`` strings against."""
-        return [r"moonshotai/.*", r"kimi.*", r"nvidia_nim/.*"]
+        """Regexes ADK's registry matches agent ``model`` strings against.
+
+        ADK snapshots this list once, at import time (``LLMRegistry.register``
+        below), so it cannot depend on config resolved later -- it must name
+        every provider's model-name shape up front. Kept scoped (not a
+        catch-all) so it never shadows a test double registered under its own
+        pattern, such as ``test_graph_integration.py``'s ``stub/.*``.
+        """
+        return [
+            r"moonshotai/.*",  # NVIDIA NIM
+            r"kimi.*",
+            r"nvidia_nim/.*",
+            r"[\w.-]+:[\w.-]+",  # Ollama's "name:tag" shape, e.g. qwen3:4b
+        ]
 
     @property
     def _client(self) -> NVIDIAKimiClient:
@@ -300,14 +397,83 @@ class KimiK3Llm(BaseLlm):
             # NIM requires at least one non-system turn.
             messages.append({"role": "user", "content": "Proceed."})
 
-        return {
+        tools = _tools_to_openai(config)
+        call: dict[str, Any] = {
             "messages": messages,
-            "tools": _tools_to_openai(config) or None,
+            "tools": tools or None,
             "response_format": _response_format(config),
             "max_tokens": config.max_output_tokens,
             "temperature": config.temperature,
             "seed": config.seed,
         }
+        if any(t["function"]["name"] == "set_model_response" for t in tools):
+            # ADK's structured-output tool has its own retry-capable
+            # validation; answering in plain text instead skips it and hits
+            # an unguarded validator that crashes the whole run. Weaker
+            # models sometimes do that unless a tool call is forced.
+            call["tool_choice"] = "required"
+        return call
+
+    async def _ensure_structured_tool_call(
+        self, call: dict[str, Any], completion: Completion
+    ) -> Completion:
+        """Get a schema-carrying turn to yield a ``set_model_response`` call.
+
+        Needed because a provider does not always honor
+        ``tool_choice="required"`` (Ollama, observed, does not). Two things
+        rescue such a turn, in order of cost: reading the call out of the
+        text the model did produce -- it usually described the call correctly
+        instead of making it -- and only failing that, re-asking, up to
+        ``MAX_STRUCTURED_OUTPUT_RETRIES`` times.
+        """
+        tools = call.get("tools") or []
+        if not any(t["function"]["name"] == "set_model_response" for t in tools):
+            return completion
+
+        fields = _schema_fields(tools, "set_model_response")
+        messages = list(call["messages"])
+        for _ in range(MAX_STRUCTURED_OUTPUT_RETRIES):
+            if completion.has_tool_calls:
+                return completion
+            recovered = _recover_tool_call(completion.text, "set_model_response", fields)
+            if recovered:
+                completion.tool_calls = [recovered]
+                completion.text = ""
+                return completion
+            messages.append({"role": "assistant", "content": completion.text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You answered in plain text instead of calling the "
+                        "set_model_response tool. Call set_model_response now "
+                        "with your structured answer -- do not answer in "
+                        "plain text."
+                    ),
+                }
+            )
+            completion = await self._client.acomplete(
+                messages,
+                tools=tools,
+                tool_choice="required",
+                response_format=call.get("response_format"),
+                max_tokens=call.get("max_tokens"),
+                temperature=call.get("temperature"),
+                seed=call.get("seed"),
+            )
+
+        if completion.has_tool_calls:
+            return completion
+        recovered = _recover_tool_call(completion.text, "set_model_response", fields)
+        if recovered:
+            completion.tool_calls = [recovered]
+            completion.text = ""
+            return completion
+        raise StructuredOutputError(
+            "Model did not call set_model_response after "
+            f"{MAX_STRUCTURED_OUTPUT_RETRIES} retries; last answer: "
+            f"{completion.text!r}"
+        )
 
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
@@ -329,16 +495,12 @@ class KimiK3Llm(BaseLlm):
                 ):
                     accumulated.append(delta)
                     yield LlmResponse(
-                        content=types.Content(
-                            role="model", parts=[types.Part(text=delta)]
-                        ),
+                        content=types.Content(role="model", parts=[types.Part(text=delta)]),
                         partial=True,
                     )
                 text = "".join(accumulated)
                 yield LlmResponse(
-                    content=types.Content(
-                        role="model", parts=[types.Part(text=text)]
-                    ),
+                    content=types.Content(role="model", parts=[types.Part(text=text)]),
                     turn_complete=True,
                     finish_reason=types.FinishReason.STOP,
                     model_version=self.model,
@@ -346,7 +508,8 @@ class KimiK3Llm(BaseLlm):
                 return
 
             completion = await self._client.acomplete(**call)
-        except NVIDIAError as exc:
+            completion = await self._ensure_structured_tool_call(call, completion)
+        except (NVIDIAError, StructuredOutputError) as exc:
             # Surface provider failures as ADK error responses so the runner can
             # emit an event instead of tearing down the whole workflow.
             logger.error("Kimi K3 call failed: %s", exc)

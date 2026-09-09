@@ -22,7 +22,14 @@ from google.genai import types
 
 from app.agents import common as agents_common
 from app.agents import tester as tester_module
-from app.schemas import ChangeScope, CodeReview, ReviewVerdict, Severity, TestReport
+from app.schemas import (
+    ChangeScope,
+    CodeReview,
+    ReviewVerdict,
+    RunMode,
+    Severity,
+    TestReport,
+)
 from app.workflows import graph as graph_module
 
 STUB_MODEL = "stub/deterministic"
@@ -165,6 +172,7 @@ DEFAULT_RESPONSES: dict = {
             {
                 "task_id": "T-1",
                 "objective": "add the function",
+                "files": ["textstats/stats.py"],
                 "validation_criteria": "its test passes",
             }
         ]
@@ -202,19 +210,28 @@ def stub_everything(monkeypatch):
     def install(reports, changed_files):
         sandbox = StubSandbox(reports)
         monkeypatch.setattr(tester_module, "get_sandbox", lambda: sandbox)
-        monkeypatch.setattr(graph_module, "_changed_files", lambda: list(changed_files))
+        monkeypatch.setattr(
+            graph_module, "_changed_files", lambda state: list(changed_files)
+        )
+        # initial_state fingerprints the tree; that would shell out to git too.
+        monkeypatch.setattr(graph_module, "_tree_state", lambda: {})
         return sandbox
 
     return install
 
 
-async def run_graph(state: dict | None = None) -> tuple[dict, list[str]]:
+async def run_graph(
+    state: dict | None = None, mode: RunMode = RunMode.THINKING
+) -> tuple[dict, list[str]]:
     """Run the whole graph and return final state plus the node sequence."""
-    runner = InMemoryRunner(agent=graph_module.build_workflow(), app_name="graph_test")
+    runner = InMemoryRunner(
+        agent=graph_module.build_workflow(mode), app_name="graph_test"
+    )
     session = await runner.session_service.create_session(
         app_name="graph_test",
         user_id="u",
-        state=state or graph_module.initial_state("add a feature", limit=2),
+        state=state
+        or graph_module.initial_state("add a feature", limit=2, mode=mode),
     )
     message = types.Content(role="user", parts=[types.Part(text="add a feature")])
 
@@ -425,7 +442,7 @@ async def test_analysis_runs_before_architecture(stub_everything):
 async def test_git_is_never_invoked_on_the_host_during_the_graph(
     stub_everything, monkeypatch
 ):
-    """The stub replaces _changed_files; nothing else may shell out to git."""
+    """The stubs replace every git read; nothing else may shell out to git."""
     stub_everything([TestReport(passed=1, test_count=1, exit_code=0)], ["a.py"])
     StubLlm.responses = {"Code Reviewer": review_payload(ReviewVerdict.APPROVED)}
 
@@ -440,3 +457,44 @@ async def test_git_is_never_invoked_on_the_host_during_the_graph(
     monkeypatch.setattr(subprocess, "run", watched)
     await run_graph()
     assert calls == []
+
+
+# ------------------------------------------------------------------ run modes
+
+
+@pytest.mark.asyncio
+async def test_a_normal_run_plans_then_implements(stub_everything):
+    """The direct path: plan, implement, test, report -- no architecture."""
+    stub_everything([TestReport(passed=4, test_count=4, exit_code=0)], ["notes.md"])
+    state, visited = await run_graph(mode=RunMode.NORMAL)
+
+    assert [n for n in visited if n != "se_agent_normal"] == [
+        "planner",
+        "implement",
+        "test",
+        "report",
+    ]
+    # The plan reaches state under the key the full pipeline uses, so the
+    # coordinator and reporter read it without knowing which mode they are in.
+    assert state["plan"]["tasks"][0]["task_id"] == "T-1"
+
+
+@pytest.mark.asyncio
+async def test_a_normal_run_reports_a_change_no_test_covered(stub_everything):
+    """Writing a document must not be blocked by an empty test suite."""
+    stub_everything([TestReport(test_count=0, exit_code=5)], ["summary.md"])
+    state, visited = await run_graph(mode=RunMode.NORMAL)
+
+    assert state["tests_inconclusive"] is True
+    assert state["files_changed"] == ["summary.md"]
+    assert "report" in visited
+
+
+@pytest.mark.asyncio
+async def test_a_normal_run_that_changed_nothing_is_not_a_pass(stub_everything):
+    """No tests and no diff is no evidence; it must not read as success."""
+    stub_everything([TestReport(test_count=0, exit_code=5)], [])
+    state, _ = await run_graph(mode=RunMode.NORMAL)
+
+    assert not state.get("files_changed")
+    assert state.get("iterations_exhausted") is True

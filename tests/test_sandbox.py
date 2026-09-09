@@ -121,3 +121,93 @@ def test_a_sandbox_failure_is_flagged_as_not_a_test_failure(monkeypatch):
     assert result["ok"] is False
     assert result["error"] == "bash missing"
     assert "not a test failure" in result["hint"]
+
+
+# ------------------------------------------------------- unittest's output
+
+
+UNITTEST_PASS = """
+test_01_ok (tester.TestKnapsack.test_01_ok) ... ok
+test_02_ok (tester.TestKnapsack.test_02_ok) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.001s
+
+OK
+"""
+
+UNITTEST_FAIL = """
+test_01_bad (tester.TestKnapsack.test_01_bad) ... FAIL
+
+======================================================================
+FAIL: test_01_bad (tester.TestKnapsack.test_01_bad)
+----------------------------------------------------------------------
+AssertionError: ValueError not raised
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.002s
+
+FAILED (failures=1, errors=1, skipped=1)
+"""
+
+UNITTEST_IMPORT_ERROR = """
+tester (unittest.loader._FailedTest.tester) ... ERROR
+
+======================================================================
+ERROR: tester (unittest.loader._FailedTest.tester)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: tester
+ModuleNotFoundError: No module named 'tester'
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (errors=1)
+"""
+
+
+def test_a_green_unittest_run_is_recognized_as_green():
+    """pytest is not the only runner; its output format is not the only one."""
+    report = parse_pytest_output(UNITTEST_PASS)
+    assert report.test_count == 2
+    assert report.passed == 2
+    assert report.is_green
+
+
+def test_unittest_counts_the_passes_it_never_prints():
+    """unittest reports only what went wrong; the rest passed."""
+    report = parse_pytest_output(UNITTEST_FAIL)
+    assert report.test_count == 5
+    assert (report.failed, report.errors, report.skipped) == (1, 1, 1)
+    assert report.passed == 2
+    assert not report.is_green
+    assert report.failure_summary == ["FAIL tester.TestKnapsack.test_01_bad"]
+
+
+def test_a_unittest_run_that_collected_nothing_is_not_green():
+    """An empty suite reports Ran 0 tests ... OK, which is not a pass."""
+    report = parse_pytest_output("Ran 0 tests in 0.000s\n\nOK\n")
+    assert report.test_count == 0
+    assert not report.is_green
+
+
+def test_a_suite_that_would_not_import_is_an_execution_error():
+    """A broken environment is not a failing implementation."""
+    report = parse_pytest_output(UNITTEST_IMPORT_ERROR)
+    assert report.execution_error
+    assert "could not be imported (tester)" in report.execution_error
+    assert not report.is_green
+
+
+def test_an_import_error_does_not_masquerade_as_a_code_bug():
+    """Left as 1 error it sends the debugger after a bug that may not exist."""
+    report = parse_pytest_output(UNITTEST_IMPORT_ERROR)
+    assert report.failed == 0
+    assert "says nothing about whether the code is correct" in report.execution_error
+
+
+def test_a_genuine_unittest_failure_is_not_called_an_execution_error():
+    """The distinction has to cut both ways to be worth anything."""
+    report = parse_pytest_output(UNITTEST_FAIL)
+    assert not report.execution_error
+    assert report.failed == 1

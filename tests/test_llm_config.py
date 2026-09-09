@@ -21,6 +21,9 @@ ENV_NAMES = (
     "NVIDIA_BASE_URL",
     "NVIDIA_TIMEOUT",
     "NVIDIA_MAX_RETRIES",
+    "SE_AGENT_LLM_PROVIDER",
+    "OLLAMA_MODEL",
+    "OLLAMA_BASE_URL",
 )
 
 
@@ -94,3 +97,40 @@ def test_retries_are_bounded():
     assert NVIDIAConfig(api_key="k", max_retries=999).max_retries == 10
     with pytest.raises(ValueError):
         NVIDIAConfig(api_key="k", max_retries=-1)
+
+
+def test_ollama_provider_needs_no_api_key(clean_env):
+    clean_env.setenv("SE_AGENT_LLM_PROVIDER", "ollama")
+    config = get_config()
+    assert config.provider == "ollama"
+    assert config.api_key == ""
+    assert config.model == "qwen3:4b"
+    assert config.base_url == "http://localhost:11434/v1"
+
+
+def test_ollama_model_and_base_url_are_overridable(clean_env):
+    clean_env.setenv("SE_AGENT_LLM_PROVIDER", "ollama")
+    clean_env.setenv("OLLAMA_MODEL", "qwen3:8b")
+    clean_env.setenv("OLLAMA_BASE_URL", "http://example.internal:11434/v1")
+    config = get_config()
+    assert config.model == "qwen3:8b"
+    assert config.base_url == "http://example.internal:11434/v1"
+
+
+def test_unknown_provider_falls_back_to_nvidia(clean_env):
+    clean_env.setenv("SE_AGENT_LLM_PROVIDER", "made-up")
+    clean_env.setenv("NVIDIA_API_KEY", "nvapi-test")
+    config = get_config()
+    assert config.provider == "nvidia"
+    assert config.model == DEFAULT_MODEL
+
+
+def test_nvidia_provider_still_requires_a_key(clean_env):
+    clean_env.setenv("SE_AGENT_LLM_PROVIDER", "nvidia")
+    with pytest.raises(MissingAPIKeyError):
+        get_config()
+
+
+def test_constructing_nvidia_config_directly_still_requires_a_key():
+    with pytest.raises(ValueError):
+        NVIDIAConfig(api_key="")

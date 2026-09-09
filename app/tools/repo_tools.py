@@ -11,6 +11,7 @@ output are all impossible from inside a tool call.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from typing import Any
@@ -24,11 +25,39 @@ from .workspace import (
     get_workspace,
 )
 
+logger = logging.getLogger(__name__)
+
 GIT_TIMEOUT = 30
 
 
 def _fail(message: str) -> dict[str, Any]:
     return {"ok": False, "error": message}
+
+
+def _git_prefix(workspace: Workspace) -> str:
+    """Where the workspace sits inside its git repository, "" if it is the root.
+
+    A workspace is often a subdirectory of a larger repository. Git does not
+    care about the current directory -- it reports the whole repository -- so
+    without this a workspace confined to ``config/`` would be handed the parent
+    project's changes and, through ``git_diff``, the contents of files it is not
+    allowed to read.
+    """
+    result = _run_git(workspace, ["rev-parse", "--show-prefix"])
+    return result["output"].strip() if result["ok"] else ""
+
+
+def _inside(path: str, prefix: str) -> str | None:
+    """``path`` (repository-relative) as workspace-relative, or None if outside."""
+    # Git C-quotes any path with a space or a quote in it.
+    path = path.strip()
+    if len(path) > 1 and path.startswith('"') and path.endswith('"'):
+        path = path[1:-1]
+    if not prefix:
+        return path
+    if not path.startswith(prefix):
+        return None
+    return path[len(prefix) :]
 
 
 def _run_git(workspace: Workspace, args: list[str]) -> dict[str, Any]:
@@ -51,7 +80,14 @@ def _run_git(workspace: Workspace, args: list[str]) -> dict[str, Any]:
     if result.returncode != 0:
         stderr = (result.stderr or "").strip()
         if "not a git repository" in stderr.lower():
-            return _fail("this workspace is not a git repository")
+            # Spelled out, because the natural inference from a bare failure is
+            # "so nothing changed" -- and an agent that draws it reports the
+            # opposite of the truth about work it just did.
+            return _fail(
+                "this workspace is not a git repository, so there is no diff to "
+                "read. This says nothing about whether files changed: read them, "
+                "or use the files_changed list in state."
+            )
         return _fail(f"git {' '.join(args)} failed: {stderr[:500]}")
 
     output, truncation = clamp(result.stdout)
@@ -204,14 +240,20 @@ def git_status() -> dict[str, Any]:
         A dict with the porcelain status output and a parsed file list.
     """
     workspace = get_workspace()
-    result = _run_git(workspace, ["status", "--porcelain=v1"])
+    # The trailing pathspec confines the answer to this workspace; a workspace
+    # inside a larger repository must not be told about the rest of it.
+    result = _run_git(workspace, ["status", "--porcelain=v1", "--", "."])
     if not result["ok"]:
         return result
 
+    prefix = _git_prefix(workspace)
     changes = []
     for line in result["output"].splitlines():
         if len(line) > 3:
-            changes.append({"status": line[:2].strip(), "path": line[3:].strip()})
+            path = _inside(line[3:], prefix)
+            if path is None:
+                continue
+            changes.append({"status": line[:2].strip(), "path": path})
     return {
         "ok": True,
         "clean": not changes,
@@ -231,7 +273,10 @@ def git_diff(path: str = "", staged: bool = False) -> dict[str, Any]:
         A dict with the diff text and a per-file summary.
     """
     workspace = get_workspace()
-    base = ["diff"]
+    # --relative both rewrites paths relative to this directory and drops
+    # changes outside it, so a subdirectory workspace cannot read out the
+    # parent project through its diff.
+    base = ["diff", "--relative"]
     if staged:
         base.append("--cached")
 
@@ -242,6 +287,9 @@ def git_diff(path: str = "", staged: bool = False) -> dict[str, Any]:
         except WorkspaceError as exc:
             return _fail(str(exc))
         scope = ["--", path]
+
+    if not scope:
+        scope = ["--", "."]
 
     result = _run_git(workspace, [*base, *scope])
     if not result["ok"]:
@@ -386,3 +434,94 @@ READ_ONLY_TOOLS = [
 ]
 
 WRITE_TOOLS = [write_file, edit_file]
+
+
+# A fingerprint of a large tree is taken twice per iteration, so it is bounded.
+# Past this many files the comparison is still sound -- iter_files walks in
+# sorted order, so both snapshots cover the same prefix.
+FINGERPRINT_LIMIT = 5000
+
+
+def _filesystem_state(workspace: Workspace) -> dict[str, str] | None:
+    """Fingerprint by size and modification time, for a directory without git.
+
+    Coarser than a diff: a rewrite that preserves both size and mtime reads as
+    unchanged. Every ordinary edit changes the mtime, so in practice this
+    answers the only question asked of it -- did anything here change?
+
+    ``iter_files`` skips ``__pycache__`` and ``.pytest_cache``, so running the
+    tests does not by itself look like a change to the source.
+    """
+    state: dict[str, str] = {}
+    try:
+        for path in workspace.iter_files():
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            state[workspace.relative(path)] = f"{info.st_size}/{info.st_mtime_ns}"
+            if len(state) >= FINGERPRINT_LIMIT:
+                break
+    except (WorkspaceError, OSError) as exc:
+        logger.warning("could not fingerprint the workspace: %s", exc)
+        return None
+    return state
+
+
+# Not an agent tool: the workflow uses this to tell its own edits apart from a
+# working tree that was already dirty when the run started.
+def working_tree_state() -> dict[str, str] | None:
+    """Fingerprint every uncommitted change in the workspace.
+
+    Maps workspace-relative path -> an opaque marker of that path's current
+    content. Two of these compared tell you which files a run actually touched;
+    a plain path list cannot, because on an already-dirty tree every path looks
+    changed before the run begins.
+
+    Confined to the workspace like every other tool. A workspace inside a larger
+    repository must not measure the parent project's changes -- doing so credits
+    a run with edits someone else made in a directory it cannot even read.
+
+    A directory that is not a git repository still gets a fingerprint, taken
+    from the filesystem instead. Plenty of real work happens in directories
+    nobody has run ``git init`` in, and the alternative -- no evidence, so every
+    run reports having changed nothing -- makes the whole system unusable there.
+
+    Returns ``None`` only when neither git nor the filesystem can answer. That
+    is deliberately distinct from an empty dict (a genuinely clean tree) -- a
+    tool failure must not be read as evidence either way.
+    """
+    workspace = get_workspace()
+    # "diff HEAD" covers staged and unstaged edits both; plain "diff" would miss
+    # anything the agent staged. On a repository with no commits yet there is no
+    # HEAD to diff against, so fall back.
+    scope = ["--relative", "--numstat", "--", "."]
+    numstat = _run_git(workspace, ["diff", "HEAD", *scope])
+    if not numstat["ok"]:
+        numstat = _run_git(workspace, ["diff", *scope])
+    status = _run_git(workspace, ["status", "--porcelain=v1", "--", "."])
+    if not numstat["ok"] or not status["ok"]:
+        return _filesystem_state(workspace)
+
+    prefix = _git_prefix(workspace)
+    state: dict[str, str] = {}
+    for line in numstat["output"].splitlines():
+        parts = line.split("\t")
+        # --relative has already made these workspace-relative.
+        if len(parts) == 3:
+            state[parts[2].strip().strip('"')] = f"{parts[0]}/{parts[1]}"
+
+    for line in status["output"].splitlines():
+        if line.startswith("??") and len(line) > 3:
+            path = _inside(line[3:], prefix)
+            if path is None:
+                continue
+            # ponytail: size, not a hash -- an equal-length rewrite of an
+            # untracked file reads as unchanged. Hash it if that ever matters.
+            try:
+                marker = f"untracked/{(workspace.root / path).stat().st_size}"
+            except OSError:
+                marker = "untracked"
+            state.setdefault(path, marker)
+
+    return state

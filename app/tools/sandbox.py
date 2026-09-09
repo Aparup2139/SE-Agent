@@ -134,12 +134,37 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 
 def allow_unsafe() -> bool:
-    """Whether running without an isolation boundary has been accepted."""
+    """Whether running without an isolation boundary has been accepted.
+
+    Only a real environment variable counts. ``.env`` is a file inside the
+    repository the agent is editing, and a run that could write this flag
+    there would be granting the *next* run unguarded execution on the host --
+    a decision that has to stay with the person, not the agent. Observed: a
+    run wrote ``SE_AGENT_SANDBOX_ALLOW_UNSAFE=1`` into ``.env`` while trying
+    to get its own tests to pass.
+    """
+    if _came_from_dotenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE"):
+        logger.warning(
+            "ignoring SE_AGENT_SANDBOX_ALLOW_UNSAFE from .env: unguarded "
+            "execution must be granted in the environment, not in a file the "
+            "agent can write"
+        )
+        return False
     return (os.environ.get("SE_AGENT_SANDBOX_ALLOW_UNSAFE") or "").strip().lower() in {
         "1",
         "true",
         "yes",
     }
+
+
+def _came_from_dotenv(name: str) -> bool:
+    """Whether ``name`` is set in a ``.env`` file rather than the environment."""
+    try:
+        from dotenv import dotenv_values, find_dotenv
+    except ImportError:  # pragma: no cover - dotenv is a hard dependency
+        return False
+    path = find_dotenv(usecwd=True)
+    return bool(path) and name in dotenv_values(path)
 
 
 def find_bash() -> str:
@@ -171,9 +196,7 @@ def find_bash() -> str:
             return candidate
 
     detail = (
-        "the `bash` on PATH is the WSL launcher, not a shell"
-        if found
-        else "no bash is on PATH"
+        "the `bash` on PATH is the WSL launcher, not a shell" if found else "no bash is on PATH"
     )
     raise SandboxError(
         f"no native bash was found to run the sandbox script ({detail}). "
@@ -233,6 +256,26 @@ class Sandbox:
         return self._to_wsl_path(native)
 
     def _to_wsl_path(self, windows_path: str) -> str:
+        """Translate a Windows path to its WSL form.
+
+        A drive path is mapped here rather than by asking ``wslpath``, because
+        that meant launching WSL once per path -- and observed failing under
+        load with a non-zero exit and an empty stderr, which surfaced as
+        "could not translate ... for WSL:" and killed the run. WSL also warns
+        on stderr about untranslatable Windows PATH entries (any entry with a
+        space, e.g. 'D:\\Qoder IDE\\bin'), which is noise in that same channel.
+
+        ``wslpath`` still handles anything that is not a drive path -- a UNC
+        share, say.
+        """
+        path = Path(windows_path)
+        drive = path.drive
+        # ponytail: assumes the default /mnt automount root; a custom
+        # automount.root in /etc/wsl.conf would need reading that file.
+        if len(drive) == 2 and drive.endswith(":"):
+            tail = path.as_posix()[len(drive) :].lstrip("/")
+            return f"/mnt/{drive[0].lower()}/{tail}"
+
         result = subprocess.run(
             ["wsl.exe", "-d", self.config.wsl_distro, "wslpath", "-a", windows_path],
             capture_output=True,
@@ -310,13 +353,21 @@ class Sandbox:
         if self.uses_wsl:
             # `wsl -- env VAR=... bash script` is how the environment crosses
             # the boundary; WSLENV is fiddly and this is explicit.
-            return [
-                *launcher,
+            crossing = [
                 f"SE_AGENT_WORKSPACE={self._workspace_path()}",
                 f"SE_AGENT_SANDBOX_NETWORK={'1' if network else '0'}",
-                "bash",
-                *tail,
             ]
+            # The script reads these too, and nothing else carries them across:
+            # a Windows host's workspace venv is unusable from Linux, so
+            # SE_AGENT_SANDBOX_PATH is the only way to name an interpreter that
+            # works -- and dropping it here left the setting silently inert on
+            # the one platform that needs it, with the script falling back to
+            # whatever `.venv/bin` happened to exist.
+            for name in ("SE_AGENT_SANDBOX_PATH", "SE_AGENT_SANDBOX_REQUIRE"):
+                value = (os.environ.get(name) or "").strip()
+                if value:
+                    crossing.append(f"{name}={value}")
+            return [*launcher, *crossing, "bash", *tail]
         return [*launcher, *tail]
 
     def _workspace_path(self) -> str:
@@ -363,9 +414,7 @@ class Sandbox:
                 # A process group of its own, so a timeout can take the whole
                 # tree rather than just the shell.
                 start_new_session=os.name != "nt",
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-                ),
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0),
             )
         except OSError as exc:
             return ExecutionResult(
@@ -409,9 +458,7 @@ class Sandbox:
 
     # ------------------------------------------------------------------ tests
 
-    def run_tests(
-        self, command: str = "pytest -q", timeout: int | None = None
-    ) -> TestReport:
+    def run_tests(self, command: str = "pytest -q", timeout: int | None = None) -> TestReport:
         """Run the project's test suite and parse the real result."""
         return self.run_tests_with_output(command, timeout=timeout)[0]
 
@@ -463,6 +510,18 @@ _SUMMARY_COUNT = re.compile(r"(\d+)\s+(passed|failed|error|errors|skipped|xfaile
 _FAILURE_LINE = re.compile(r"^(FAILED|ERROR)\s+(\S+)(?:\s+-\s+(.*))?$", re.MULTILINE)
 
 
+# unittest reports nothing pytest's patterns match: no banner line, and its
+# tallies read "FAILED (failures=2, errors=1)".
+_UNITTEST_RAN = re.compile(r"^Ran (\d+) tests? in", re.MULTILINE)
+_UNITTEST_TALLY = re.compile(r"(failures|errors|skipped|expected failures)=(\d+)")
+_UNITTEST_FAILURE = re.compile(r"^(FAIL|ERROR): (\S+)(?:\s+\((\S+)\))?$", re.MULTILINE)
+# unittest reports a suite it could not even import as a synthetic failing test.
+_UNITTEST_IMPORT_FAILURE = re.compile(
+    r"unittest\.loader\._FailedTest|Failed to import test module"
+)
+_UNITTEST_IMPORT_NAME = re.compile(r"Failed to import test module: (\S+)")
+
+
 def parse_pytest_output(output: str) -> TestReport:
     """Extract structured counts from pytest's terminal output.
 
@@ -473,9 +532,11 @@ def parse_pytest_output(output: str) -> TestReport:
     if not output:
         return report
 
-    summary_lines = [
-        line for line in output.splitlines() if re.search(r"=+.*\bin\s[\d.]+s", line)
-    ]
+    ran = _UNITTEST_RAN.search(output)
+    if ran and not re.search(r"=+.*in\s[\d.]+s", output):
+        return _parse_unittest_output(output, int(ran.group(1)))
+
+    summary_lines = [line for line in output.splitlines() if re.search(r"=+.*\bin\s[\d.]+s", line)]
     counts: dict[str, int] = {}
     if summary_lines:
         for value, label in _SUMMARY_COUNT.findall(summary_lines[-1]):
@@ -507,10 +568,53 @@ def parse_pytest_output(output: str) -> TestReport:
 _sandbox: Sandbox | None = None
 
 
+def _parse_unittest_output(output: str, total: int) -> TestReport:
+    """Counts from ``python -m unittest``, which reports only what went wrong.
+
+    "Ran 5 tests" plus "FAILED (failures=2)" means three passed -- the passing
+    count is never stated, so it is what is left over.
+    """
+    report = TestReport(test_count=total)
+    tallies = {label: int(value) for label, value in _UNITTEST_TALLY.findall(output)}
+    report.failed = tallies.get("failures", 0)
+    report.errors = tallies.get("errors", 0)
+    report.skipped = tallies.get("skipped", 0) + tallies.get("expected failures", 0)
+    report.passed = max(0, total - report.failed - report.errors - report.skipped)
+
+    failures: list[str] = []
+    for kind, name, where in _UNITTEST_FAILURE.findall(output):
+        failures.append(f"{kind} {where or name}"[:400])
+        if len(failures) >= 20:
+            break
+    report.failure_summary = failures
+
+    # A suite that could not be imported is a broken environment, not a failing
+    # implementation. Left as "1 error" it sends the debugger hunting for a bug
+    # in code that may be perfectly correct; as an execution error it says what
+    # actually happened.
+    if _UNITTEST_IMPORT_FAILURE.search(output):
+        match = _UNITTEST_IMPORT_NAME.search(output)
+        module = f" ({match.group(1)})" if match else ""
+        report.execution_error = (
+            f"the test suite could not be imported{module}. The tests never ran, "
+            "so this says nothing about whether the code is correct."
+        )
+    return report
+
+
 def get_sandbox() -> Sandbox:
-    """Process-wide sandbox instance."""
+    """Process-wide sandbox instance, rebuilt if the workspace has moved.
+
+    A ``Sandbox`` captures its workspace when it is constructed, so a cached one
+    keeps executing in the directory of whichever run built it. In a server
+    process that outlives a single run, the next run against a different
+    repository would then read one directory through its tools and run its
+    commands in another -- tests "failing" against a suite that is not even
+    there, and a debugger sent to find out why.
+    """
     global _sandbox
-    if _sandbox is None:
+    root = get_workspace().root
+    if _sandbox is None or _sandbox.workspace.root != root:
         _sandbox = Sandbox()
     return _sandbox
 

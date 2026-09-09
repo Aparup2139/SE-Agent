@@ -121,6 +121,72 @@ pytest -q                  # 263 passed, 1 skipped
 
 ---
 
+## Two run modes
+
+The full pipeline runs nine agents before it writes a line of code. That is the
+right shape for "add rate limiting to the auth endpoints" and pure overhead for
+"write me a summary of this directory" -- and the analysis agents are most of a
+run's model calls, which on a free API tier is most of a day's quota.
+
+So pick the mode:
+
+| | **Normal** | **Thinking** (default) |
+| --- | --- | --- |
+| Path | plan -> implement -> test -> report | the whole graph |
+| Agents | planner, coordinator, tester, debugger, reporter | all nine |
+| Planning | **runs** -- names the files and what changes in each | runs, from the architecture |
+| Requirements, repository & risk analysis, architecture | skipped | run |
+| Independent review | **skipped** | required to succeed |
+| Real sandboxed tests | run, but not required to exist | required to pass |
+| Changed-file check | enforced | enforced |
+| Use it for | a known, local change: write this file, rename that, apply an obvious fix | a request that must be understood before it can be built |
+
+Both modes plan before they write. A coordinator with no plan spends its calls
+surveying the repository instead of changing it -- so the direct path keeps a
+planner, reading the repository itself and naming the real files each task
+touches. It writes to the same `plan` state key as the full pipeline's planner,
+so the coordinator and the reporter never need to know which mode they are in.
+A retry re-enters at the iteration gate, not the planner: the plan is already in
+history, and re-deriving it would cost a call to reach the same place.
+
+Two things hold in **both** modes, because they are what make a result mean
+anything: a run that changed no files can never report success, and the attempt
+budget is always enforced. What normal mode gives up is the second opinion --
+nothing independent reads the diff -- so its report says so under
+`known_limitations`.
+
+One deliberate difference: in thinking mode a suite that collected **no tests**
+is a failure, because an unverified feature is not a delivered feature. In
+normal mode it is merely inconclusive, reported as "nothing here is
+test-verified". Writing a document has no test to pass, and demanding one would
+make the task impossible rather than safe. The changed-file check carries the
+weight there.
+
+```bash
+python -m app.agent --mode normal "summarize every file in app/tools into notes.md"
+python -m app.agent "add rate limiting to the auth endpoints"   # thinking, the default
+```
+
+In the console it is the **Mode** dropdown next to Iterations; the progress
+checklist re-renders to the four steps a normal run actually takes.
+
+### What a run is allowed to claim
+
+Three facts about a run are measured, not authored by a model, and they
+overwrite whatever the reporter says about them: the request, the files that
+changed, and the test result. A reporter handed a directory that still held a
+previous task's files once reported having fixed that task's bugs on a run whose
+only act was creating a new file -- every detail true about the directory, none
+of it true about the run. The same reason the tester has no LLM.
+
+The changed-file list is measured against a fingerprint taken at run start, so
+it works on a repository that already had uncommitted work in it, and in a
+directory that is not a git repository at all. The one thing it cannot see is
+whether a change was *required*: "green tests, nothing changed" is the signature
+both of a run that silently did nothing and of a request that was already
+satisfied. So the planner declares `changes_expected` before implementing, and
+that pre-commitment is what separates the two.
+
 ## Running it
 
 ### Option A -- the command line
@@ -136,6 +202,7 @@ python -m app.agent --repo ../my-project --max-iterations 3 \
 | --- | --- |
 | `--repo PATH` | The repository to work in (default: the current directory) |
 | `--max-iterations N` | Implement/test/review attempts (default 5, hard ceiling 10) |
+| `--mode normal\|thinking` | Direct path or the full pipeline (default `thinking`) |
 | `--verbose` | Debug logging |
 
 The process exits non-zero if the run did not succeed, so it composes in CI.
@@ -152,8 +219,13 @@ Open <http://127.0.0.1:8000>.
    and the problems are printed next to it -- so a missing isolation boundary
    is visible before you submit rather than twenty minutes into a run. The
    line names the active tier, so it never implies containment.
-2. Type the feature request. Optionally set a repository path, the iteration
-   budget, and an API token if the server has one configured.
+2. Type the feature request and pick the target directory from the dropdown.
+   It browses the machine: pick a drive, then descend, `↑ up` climbs, and the
+   directory shown is the one the run targets -- leave it at *this computer* to
+   use the server's own directory. With `SE_AGENT_REPO_ROOT` set, browsing
+   starts at that root and cannot climb above it. Then set the iteration
+   budget. The console sends no token, so a server started with
+   `SE_AGENT_API_TOKEN` must be driven by an HTTP client, not this page.
 3. Press **Run**. The response is a server-sent event stream, so progress
    appears as it happens.
 4. The left rail tracks the eight phases, marking each done, active or failed,
@@ -172,7 +244,8 @@ HTTP surface may do:
 | Variable | Effect |
 | --- | --- |
 | `SE_AGENT_API_TOKEN` | Bearer token required on every run. Unset, the server refuses any caller that is not on loopback. |
-| `SE_AGENT_REPO_ROOT` | The only directory tree a request may target. Unset, the `repo` field is refused outright and runs use the server's own directory. |
+| `GOOGLE_API_KEY` | Gemini key, required when `SE_AGENT_LLM_PROVIDER=gemini`. The free tier allows 20 requests per day *per model*, so each agent runs on its own model and a run fails over when one is spent; `GEMINI_MODELS` overrides that list and `GEMINI_MODEL` pins one. Gemini 2.5 Flash is refused to new keys by Google -- 3.6 Flash is the replacement. |
+| `SE_AGENT_REPO_ROOT` | Confines the directory tree a request may target. Unset, a loopback caller may pick any directory on the machine and a remote caller may pick none. |
 | `SE_AGENT_SANDBOX_ALLOW_UNSAFE` | Permit a run with no isolation boundary. See **The sandbox**. |
 | `SE_AGENT_SANDBOX_WSL` | Run the sandbox inside a WSL distribution, to reach a real tier from Windows. |
 
@@ -288,6 +361,15 @@ Every claim on this page has a test behind it. Run the whole suite with
 | Edge case | What must happen | Check it |
 | --- | --- | --- |
 | A test suite collects nothing | Reported as an error, never a pass | `pytest -q -k no_tests_collected_is_an_error` |
+| The target is not a git repository | Change is still detected, from the filesystem | `pytest -q -k falls_back_to_the_filesystem` |
+| The workspace is a subdirectory of a repo | Git is confined to it, and cannot read the parent | `pytest -q -k confined_git_diff` |
+| Running the tests leaves caches behind | `__pycache__` is not mistaken for a change | `pytest -q -k fingerprint_ignores_test_artifacts` |
+| Tests live in `tester.py`, which pytest ignores | The runner is detected, not assumed | `pytest -q -k unittest_suite_pytest_would_never_collect` |
+| The runner is `unittest`, not pytest | Its output is parsed; passes are inferred | `pytest -q -k unittest_counts_the_passes` |
+| The test suite will not even import | Reported as could-not-run, not as a code bug | `pytest -q -k would_not_import` |
+| A second run targets a different repo | It gets a fresh sandbox, not the first run's directory | `pytest -q -k new_workspace_gets_a_new_sandbox` |
+| The request was already satisfied | Success, not a failed no-op | `pytest -q -k verified_no_op` |
+| A plan names no files | Rejected: it is a description, not a plan | `pytest -q -k names_no_files` |
 | The test command crashes on import | Execution error, not "0 failures" | `pytest -q -k collection_crash` |
 | The sandbox itself fails to start | `execution_error`, zero failures, not a red suite | `pytest -q -k reserved_code_means_the_sandbox_failed` |
 | Tests pass but nothing was implemented | Routed to failure, review never runs | `pytest -q -k green_suite_with_no_diff` |

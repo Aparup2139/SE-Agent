@@ -54,11 +54,40 @@ SECRET_FILENAMES = frozenset(
 )
 SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks")
 BINARY_SUFFIXES = (
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".pdf",
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
-    ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a", ".class",
-    ".pyc", ".pyd", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".wav",
-    ".sqlite", ".db",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    ".bmp",
+    ".pdf",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".rar",
+    ".so",
+    ".dll",
+    ".dylib",
+    ".exe",
+    ".bin",
+    ".o",
+    ".a",
+    ".class",
+    ".pyc",
+    ".pyd",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".mp4",
+    ".mp3",
+    ".wav",
+    ".sqlite",
+    ".db",
 )
 
 
@@ -142,8 +171,7 @@ class Workspace:
 
         if not self.contains(resolved):
             raise WorkspaceError(
-                f"path escapes the workspace: {relative_path!r} resolves outside "
-                f"{self.root}"
+                f"path escapes the workspace: {relative_path!r} resolves outside {self.root}"
             )
         return resolved
 
@@ -174,18 +202,14 @@ class Workspace:
         if not path.exists():
             raise WorkspaceError(f"file not found: {self.relative(path)}")
         if path.is_dir():
-            raise WorkspaceError(
-                f"{self.relative(path)} is a directory -- use list_files instead"
-            )
+            raise WorkspaceError(f"{self.relative(path)} is a directory -- use list_files instead")
         if is_secret_path(path):
             raise WorkspaceError(
                 f"refusing to read {self.relative(path)}: this file holds "
                 "credentials and must never enter a prompt"
             )
         if is_probably_binary(path):
-            raise WorkspaceError(
-                f"refusing to read {self.relative(path)}: file is binary"
-            )
+            raise WorkspaceError(f"refusing to read {self.relative(path)}: file is binary")
 
         size = path.stat().st_size
         try:
@@ -214,7 +238,16 @@ class Workspace:
             raise WorkspaceError(f"not a directory: {self.relative(base)}")
 
         for path in sorted(base.rglob(pattern)):
-            if path.is_file() and not self.is_ignored(path):
+            # Ignore first: it is a pure string check, so an ignored tree never
+            # gets stat'ed. A venv built under WSL leaves symlinks Windows
+            # cannot stat at all, and listing files must not die on one.
+            if self.is_ignored(path):
+                continue
+            try:
+                is_file = path.is_file()
+            except OSError:
+                continue  # a path we may not stat is not a file we can offer
+            if is_file:
                 yield path
 
 

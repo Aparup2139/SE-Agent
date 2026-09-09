@@ -36,6 +36,22 @@ class Phase(str, Enum):
     FINAL = "final"
 
 
+class RunMode(str, Enum):
+    """How much of the pipeline a run goes through.
+
+    ``NORMAL`` is the direct path: plan, implement, test, report. It exists
+    because the full pipeline's four analysis agents are pure overhead for a
+    task whose shape is already known, and they are the bulk of a run's model
+    calls.
+
+    ``THINKING`` is the whole graph: requirements, parallel repository and risk
+    analysis, architecture, planning, then implementation under review.
+    """
+
+    NORMAL = "normal"
+    THINKING = "thinking"
+
+
 class Severity(str, Enum):
     LOW = "low"
     MEDIUM = "medium"
@@ -209,6 +225,32 @@ class Task(SEModel):
 class ImplementationPlan(SEModel):
     tasks: list[Task] = Field(default_factory=list, max_length=20)
     ordering_rationale: MediumText = ""
+    changes_expected: bool = Field(
+        default=True,
+        description=(
+            "Whether executing this plan should modify files. False only for a "
+            "request that is satisfied by verification, where the desired state "
+            "already holds."
+        ),
+    )
+
+    @field_validator("tasks")
+    @classmethod
+    def _every_task_names_its_files(cls, tasks: list[Task]) -> list[Task]:
+        """A task with no files is a description, not a plan.
+
+        ``files`` is what the coder works from and what the reviewer and the
+        reporter read afterwards. Left empty it degrades silently: the intent
+        survives in prose and nothing downstream can act on it. For a file the
+        task creates, the path it will live at is the answer.
+        """
+        for task in tasks:
+            if not task.files:
+                raise ValueError(
+                    f"task {task.task_id} names no files. List the files it "
+                    "changes, or -- for a file it creates -- the path to create."
+                )
+        return tasks
 
     @field_validator("tasks")
     @classmethod

@@ -20,17 +20,23 @@ from app.tools.sandbox import (
     SandboxConfig,
     _base_env,
 )
-from app.tools.workspace import Workspace
+from app.tools.workspace import Workspace, get_workspace
 
-needs_bash = pytest.mark.skipif(
-    shutil.which("bash") is None, reason="bash is not on PATH"
-)
+needs_bash = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not on PATH")
 
 
 @pytest.fixture(autouse=True)
 def _accept_missing_boundary(monkeypatch):
-    """These tests exercise mechanics, not the policy gate."""
+    """These tests exercise mechanics, not the policy gate.
+
+    ``SE_AGENT_SANDBOX_WSL`` is cleared too: ``SandboxConfig`` reads it from
+    the environment, so a developer with it set in ``.env`` would otherwise
+    run these against WSL, where the argv and the workspace path are
+    deliberately different. The WSL form is asserted on its own below, with
+    the distro passed explicitly.
+    """
     monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+    monkeypatch.delenv("SE_AGENT_SANDBOX_WSL", raising=False)
 
 
 @pytest.fixture
@@ -56,7 +62,19 @@ def stub_popen(monkeypatch, *, returncode=0, stdout="", stderr=""):
             seen["args"] = self.args
             seen["env"] = kw.get("env")
 
-        def communicate(self, timeout=None):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, input=None, timeout=None):
             seen["timeout"] = timeout
             return stdout, stderr
 
@@ -122,9 +140,7 @@ def test_exit_codes_are_propagated(ready_box, monkeypatch):
 # ------------------------------------------------------- sandbox vs. command
 
 
-def test_the_reserved_code_means_the_sandbox_failed_not_the_tests(
-    ready_box, monkeypatch
-):
+def test_the_reserved_code_means_the_sandbox_failed_not_the_tests(ready_box, monkeypatch):
     """Exit 97 must never look like a red suite."""
     stub_popen(
         monkeypatch,
@@ -182,9 +198,7 @@ def test_the_gate_can_be_opened_deliberately(box, monkeypatch):
 def test_a_real_tier_needs_no_gate(box, monkeypatch):
     monkeypatch.delenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", raising=False)
     monkeypatch.setattr(Sandbox, "tier", lambda self: "unshare")
-    monkeypatch.setattr(
-        Sandbox, "_ask_script", lambda self, flag: "unshare: network namespace"
-    )
+    monkeypatch.setattr(Sandbox, "_ask_script", lambda self, flag: "unshare: network namespace")
 
     ok, detail = box.preflight()
     assert ok
@@ -282,8 +296,7 @@ def test_counts_and_exit_code_come_from_the_process(ready_box, monkeypatch):
         monkeypatch,
         returncode=1,
         stdout=(
-            "FAILED tests/test_x.py::test_y - assert 1 == 2\n"
-            "===== 1 failed, 4 passed in 2.0s ====="
+            "FAILED tests/test_x.py::test_y - assert 1 == 2\n===== 1 failed, 4 passed in 2.0s ====="
         ),
     )
     report = ready_box.run_tests("pytest -q")
@@ -350,3 +363,131 @@ def test_a_real_bash_on_path_is_used(monkeypatch, tmp_path):
     shell.write_text("", encoding="utf-8")
     monkeypatch.setattr(sandbox_module.shutil, "which", lambda name: str(shell))
     assert sandbox_module.find_bash() == str(shell)
+
+
+# ------------------------------------------- who may grant unguarded execution
+
+
+def test_the_unsafe_flag_is_honored_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+    monkeypatch.setattr(sandbox_module, "_came_from_dotenv", lambda name: False)
+    assert sandbox_module.allow_unsafe() is True
+
+
+def test_the_unsafe_flag_is_ignored_when_it_comes_from_dotenv(monkeypatch):
+    """A run must not be able to disarm the guard for the next run.
+
+    Observed: an agent wrote SE_AGENT_SANDBOX_ALLOW_UNSAFE=1 into .env while
+    trying to make its own tests pass, and in doing so overwrote the API key
+    in that file and the project virtualenv.
+    """
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+    monkeypatch.setattr(sandbox_module, "_came_from_dotenv", lambda name: True)
+    assert sandbox_module.allow_unsafe() is False
+
+
+def test_dotenv_detection_reads_the_real_file(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text("SE_AGENT_SANDBOX_ALLOW_UNSAFE=1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert sandbox_module._came_from_dotenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE") is True
+    assert sandbox_module._came_from_dotenv("SOMETHING_ELSE") is False
+
+
+# ------------------------------------------------------------ WSL path mapping
+
+
+def test_a_drive_path_is_mapped_without_launching_wsl(tmp_path, monkeypatch):
+    """Asking wslpath meant one WSL launch per path, and it failed under load.
+
+    Observed: a non-zero exit with an empty stderr, surfacing as
+    "could not translate ... for WSL:" and ending the run.
+    """
+    box = Sandbox(Workspace(tmp_path), SandboxConfig(wsl_distro="Ubuntu-24.04"))
+
+    def explode(*a, **kw):  # pragma: no cover - must never be reached
+        raise AssertionError("wslpath was launched for a drive path")
+
+    monkeypatch.setattr(subprocess, "run", explode)
+    assert box._to_wsl_path(r"C:\Users\me\project") == "/mnt/c/Users/me/project"
+    assert box._to_wsl_path(r"D:\Qoder IDE\bin") == "/mnt/d/Qoder IDE/bin"
+
+
+def test_a_non_drive_path_still_asks_wslpath(tmp_path, monkeypatch):
+    box = Sandbox(Workspace(tmp_path), SandboxConfig(wsl_distro="Ubuntu-24.04"))
+    asked = {}
+
+    class Result:
+        returncode = 0
+        stdout = "/mnt/wsl/share\n"
+        stderr = ""
+
+    def fake_run(args, **kw):
+        asked["args"] = args
+        return Result()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert box._to_wsl_path("//server/share") == "/mnt/wsl/share"
+    assert "wslpath" in asked["args"]
+
+
+def test_the_interpreter_override_crosses_into_wsl(tmp_path, monkeypatch):
+    """SE_AGENT_SANDBOX_PATH is the only way to name a usable interpreter.
+
+    On Windows the workspace's own .venv is a Windows venv that Linux cannot
+    run, so the script needs this to find pytest. Nothing carries a variable
+    across `wsl.exe` implicitly, and omitting it here left the setting
+    silently inert: the script fell back to whatever .venv/bin existed and
+    reported "pytest: not found".
+    """
+    monkeypatch.setenv("SE_AGENT_SANDBOX_PATH", "/home/me/.venv/bin")
+    monkeypatch.setenv("SE_AGENT_SANDBOX_REQUIRE", "unshare")
+    box = Sandbox(Workspace(tmp_path), SandboxConfig(wsl_distro="Ubuntu-24.04"))
+    monkeypatch.setattr(type(box), "_to_wsl_path", lambda self, p: "/mnt/c/ws")
+
+    args = box._args("pytest -q", 60)
+
+    assert "SE_AGENT_SANDBOX_PATH=/home/me/.venv/bin" in args
+    assert "SE_AGENT_SANDBOX_REQUIRE=unshare" in args
+    # ...and they must precede the shell, or `env` would not apply them.
+    assert args.index("SE_AGENT_SANDBOX_PATH=/home/me/.venv/bin") < args.index("bash")
+
+
+def test_an_unset_override_is_not_forwarded_as_empty(tmp_path, monkeypatch):
+    monkeypatch.delenv("SE_AGENT_SANDBOX_PATH", raising=False)
+    monkeypatch.delenv("SE_AGENT_SANDBOX_REQUIRE", raising=False)
+    box = Sandbox(Workspace(tmp_path), SandboxConfig(wsl_distro="Ubuntu-24.04"))
+    monkeypatch.setattr(type(box), "_to_wsl_path", lambda self, p: "/mnt/c/ws")
+
+    args = box._args("pytest -q", 60)
+
+    assert not any(a.startswith("SE_AGENT_SANDBOX_PATH") for a in args)
+    assert not any(a.startswith("SE_AGENT_SANDBOX_REQUIRE") for a in args)
+
+
+def test_a_new_workspace_gets_a_new_sandbox(tmp_path, monkeypatch):
+    """Otherwise the second run in a server process runs in the first run's
+    directory: its tools read one repository while its shell is in another.
+
+    That is not a subtle failure -- the test suite it runs is a different
+    project's, so a correct change "fails" and the debugger is sent to explain
+    why.
+    """
+    monkeypatch.setenv("SE_AGENT_SANDBOX_ALLOW_UNSAFE", "1")
+    first_repo = tmp_path / "first"
+    second_repo = tmp_path / "second"
+    first_repo.mkdir()
+    second_repo.mkdir()
+
+    sandbox_module.reset_sandbox()
+    get_workspace(str(first_repo))
+    first = sandbox_module.get_sandbox()
+    assert first.workspace.root == first_repo.resolve()
+
+    get_workspace(str(second_repo))
+    second = sandbox_module.get_sandbox()
+    assert second is not first
+    assert second.workspace.root == second_repo.resolve()
+
+    # Same workspace, same sandbox: this must not rebuild on every call.
+    assert sandbox_module.get_sandbox() is second
+    sandbox_module.reset_sandbox()

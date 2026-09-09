@@ -23,25 +23,98 @@ from google.genai import types
 
 from ..schemas import TestReport
 from ..tools.sandbox import Sandbox, get_sandbox
+from ..tools.workspace import Workspace, get_workspace
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEST_COMMAND = "pytest -q"
 
+# pytest only collects files matching these. A test file named anything else --
+# `tester.py`, `checks.py` -- is invisible to it, and "0 tests collected" is
+# indistinguishable from "this change is untested".
+PYTEST_PATTERNS = ("test_*.py", "*_test.py")
+
+# A declared config means the project has already chosen pytest; believe it
+# rather than sniffing around for something else.
+PYTEST_CONFIG_FILES = ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini")
+
+MANIFEST_COMMANDS = (
+    ("package.json", "npm test"),
+    ("go.mod", "go test ./..."),
+    ("Cargo.toml", "cargo test"),
+)
+
+# Enough to name the test modules of a small project without building a command
+# line that no shell will accept.
+MAX_UNITTEST_MODULES = 20
+
 
 def _resolve_command(state: dict[str, Any]) -> str:
-    """Use the command the repository analysis found, not a guess.
+    """Use the command the repository analysis found, else work it out.
 
     Projects differ: `pytest -q`, `npm test`, `go test ./...`. The repository
-    agent reads this out of the manifest; falling back to a default is a last
-    resort, not the normal path.
+    agent reads this out of the manifest, and on the direct path it never runs
+    at all -- so the fallback is a real detection pass, not a guess.
     """
     repository = state.get("repository") or {}
     if isinstance(repository, dict):
         command = (repository.get("test_command") or "").strip()
         if command:
             return command
+    return detect_test_command()
+
+
+def detect_test_command(workspace: Workspace | None = None) -> str:
+    """Work out how to run this project's tests, by looking at it.
+
+    Deterministic on purpose. Asking a model "how do I test this?" costs a call
+    and can be wrong in a way nothing catches; the filesystem already knows.
+    """
+    workspace = workspace or get_workspace()
+    root = workspace.root
+
+    if any((root / name).is_file() for name in PYTEST_CONFIG_FILES):
+        return DEFAULT_TEST_COMMAND
+
+    for pattern in PYTEST_PATTERNS:
+        if next(iter(workspace.iter_files(pattern=f"**/{pattern}")), None):
+            return DEFAULT_TEST_COMMAND
+
+    modules = _unittest_modules(workspace)
+    if modules:
+        # Named explicitly rather than discovered: `unittest discover` with a
+        # wide pattern imports every module in the tree, side effects included.
+        return "python -m unittest -v " + " ".join(modules)
+
+    for name, command in MANIFEST_COMMANDS:
+        if (root / name).is_file():
+            return command
+
     return DEFAULT_TEST_COMMAND
+
+
+def _unittest_modules(workspace: Workspace) -> list[str]:
+    """Importable module names of files holding ``unittest`` test cases.
+
+    These are the files pytest would skip on name alone. pytest can run a
+    unittest suite, but only if it collects the file in the first place.
+    """
+    found: list[str] = []
+    for path in workspace.iter_files(pattern="**/*.py"):
+        relative = workspace.relative(path)
+        # A module name has to be importable: no dashes, no dotted directories.
+        stem = relative[:-3]
+        if not all(part.isidentifier() for part in stem.split("/")):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "unittest.TestCase" in text or "unittest.IsolatedAsyncioTestCase" in text:
+            found.append(stem.replace("/", "."))
+        if len(found) >= MAX_UNITTEST_MODULES:
+            break
+    return found
 
 
 def _summarize(report: TestReport) -> str:

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .schemas import Phase, StageStatus
+from .schemas import Phase, RunMode, StageStatus
 
 # Which workflow node belongs to which phase, for the checklist a UI renders.
 NODE_PHASES: dict[str, Phase] = {
@@ -46,6 +46,23 @@ PHASE_ORDER = [
     Phase.REVIEW,
     Phase.FINAL,
 ]
+
+# The direct path visits four of them. Listing the subset explicitly (rather
+# than filtering PHASE_ORDER) keeps the checklist a UI renders honest: a normal
+# run shows four steps and completes four, instead of showing eight and leaving
+# four pending forever.
+NORMAL_PHASE_ORDER = [
+    Phase.PLANNING,
+    Phase.CODING,
+    Phase.TESTING,
+    Phase.FINAL,
+]
+
+
+def phase_order(mode: RunMode = RunMode.THINKING) -> list[Phase]:
+    """The phases a run in this mode actually passes through."""
+    return NORMAL_PHASE_ORDER if mode is RunMode.NORMAL else PHASE_ORDER
+
 
 PHASE_LABELS = {
     Phase.REQUIREMENTS: "Requirements",
@@ -91,9 +108,11 @@ class RunTracker:
     take down a run.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, mode: RunMode = RunMode.THINKING) -> None:
+        self.mode = mode
+        self.order = phase_order(mode)
         self.phase_status: dict[Phase, StageStatus] = {
-            phase: StageStatus.PENDING for phase in PHASE_ORDER
+            phase: StageStatus.PENDING for phase in self.order
         }
         self.current_phase: Phase | None = None
         self.current_agent: str = ""
@@ -107,9 +126,14 @@ class RunTracker:
         if phase is self.current_phase:
             return None
 
+        if phase not in self.phase_status:
+            # A node from a phase this mode does not track. Report it, but do
+            # not invent a checklist row for it.
+            return None
+
         # Everything before the new phase has, by definition, been reached.
-        index = PHASE_ORDER.index(phase)
-        for earlier in PHASE_ORDER[:index]:
+        index = self.order.index(phase)
+        for earlier in self.order[:index]:
             if self.phase_status[earlier] is StageStatus.RUNNING:
                 self.phase_status[earlier] = StageStatus.COMPLETE
 
@@ -133,7 +157,7 @@ class RunTracker:
         }
         return [
             f"{marks[self.phase_status[phase]]} {PHASE_LABELS[phase]}"
-            for phase in PHASE_ORDER
+            for phase in self.order
         ]
 
     # ------------------------------------------------------------------ events
@@ -280,7 +304,7 @@ class RunTracker:
 
     def finish(self) -> None:
         """Mark the run complete, so the checklist does not end mid-phase."""
-        for phase in PHASE_ORDER:
+        for phase in self.order:
             if self.phase_status[phase] is StageStatus.RUNNING:
                 self.phase_status[phase] = StageStatus.COMPLETE
 

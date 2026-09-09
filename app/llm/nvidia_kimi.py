@@ -177,11 +177,14 @@ class NVIDIAKimiClient:
         return self.config.model
 
     def _headers(self, stream: bool) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.config.api_key}",
+        headers = {
             "Accept": "text/event-stream" if stream else "application/json",
             "Content-Type": "application/json",
         }
+        # Keyless local providers (Ollama) need no bearer token.
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        return headers
 
     def _payload(
         self,

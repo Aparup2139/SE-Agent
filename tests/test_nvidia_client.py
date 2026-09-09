@@ -112,6 +112,22 @@ def test_payload_carries_required_fields(monkeypatch, client):
     assert payload["seed"] == 0
 
 
+def test_no_authorization_header_when_key_is_blank(monkeypatch):
+    seen = {}
+
+    def capture(url, headers=None, json=None, timeout=None, **kw):
+        seen.update({"headers": headers})
+        return FakeResponse(200, completion_body())
+
+    monkeypatch.setattr(requests, "post", capture)
+    keyless_client = NVIDIAKimiClient(
+        NVIDIAConfig(provider="ollama", model="qwen3:4b", base_url="http://localhost:11434/v1")
+    )
+    keyless_client.chat(MESSAGES)
+
+    assert "Authorization" not in seen["headers"]
+
+
 # ---------------------------------------------------------------- tool calling
 
 

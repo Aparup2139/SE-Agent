@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -44,10 +45,9 @@ def repo(tmp_path, monkeypatch):
 @pytest.fixture
 def git_repo(repo):
     """The same repository, with git history."""
+
     def run(*args):
-        subprocess.run(
-            ["git", *args], cwd=repo, capture_output=True, text=True, check=False
-        )
+        subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=False)
 
     run("init", "-q")
     run("config", "user.email", "test@example.com")
@@ -155,6 +155,43 @@ def test_listing_skips_vendored_directories(repo):
     assert not any("node_modules" in f for f in files)
 
 
+def test_listing_never_stats_an_ignored_tree(repo, monkeypatch):
+    """A venv built under WSL leaves links Windows cannot stat -- don't try.
+
+    ``is_ignored`` is a string check, so an ignored tree must be skipped
+    before anything touches the filesystem.
+    """
+    (repo / "venv" / "bin").mkdir(parents=True)
+    (repo / "venv" / "bin" / "python").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(Path, "is_file", _is_file_but_not_in("venv"))
+
+    files = repo_tools.list_files(".", "*")["files"]
+    assert "app/main.py" in files
+    assert not any("venv" in name for name in files)
+
+
+def test_listing_skips_a_path_it_cannot_stat(repo, monkeypatch):
+    """One unreadable entry must not take the whole listing down with it."""
+    (repo / "broken.py").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(Path, "is_file", _is_file_but_not_in("broken.py"))
+
+    files = repo_tools.list_files(".", "*.py")["files"]
+    assert "app/main.py" in files
+    assert "broken.py" not in files
+
+
+def _is_file_but_not_in(unstattable: str):
+    """``Path.is_file`` that raises WinError 1920 for one path component."""
+    real = Path.is_file
+
+    def is_file(self, *args, **kwargs):
+        if unstattable in self.parts:
+            raise OSError(1920, "The file cannot be accessed by the system")
+        return real(self, *args, **kwargs)
+
+    return is_file
+
+
 def test_listing_a_missing_directory_reports_clearly(repo):
     result = repo_tools.list_files("does_not_exist")
     assert result["ok"] is False
@@ -180,9 +217,7 @@ def test_read_file_returns_content_and_line_count(repo):
 
 
 def test_read_file_honours_a_line_range(repo):
-    (repo / "long.py").write_text(
-        "\n".join(f"line{i}" for i in range(1, 21)), encoding="utf-8"
-    )
+    (repo / "long.py").write_text("\n".join(f"line{i}" for i in range(1, 21)), encoding="utf-8")
     result = repo_tools.read_file("long.py", start_line=5, end_line=7)
     assert result["content"].splitlines() == ["line5", "line6", "line7"]
     assert result["total_lines"] == 20
@@ -348,3 +383,98 @@ def test_edit_file_reports_a_missing_snippet(repo):
 
 def test_edit_file_requires_old_text(repo):
     assert repo_tools.edit_file("app/util.py", "", "x")["ok"] is False
+
+
+# ------------------------------------------- confinement, and life without git
+
+
+def _narrow_to(monkeypatch, subdir):
+    """Point the tools at a subdirectory of the same git repository."""
+    workspace = Workspace(subdir)
+    monkeypatch.setattr(repo_tools, "get_workspace", lambda: workspace)
+    return workspace
+
+
+def test_working_tree_state_distinguishes_two_dirty_trees(git_repo):
+    """The whole point: an edit on top of an already-dirty tree must show up."""
+    (git_repo / "app" / "main.py").write_text("ambient", encoding="utf-8")
+    baseline = repo_tools.working_tree_state()
+    assert baseline == repo_tools.working_tree_state(), "must be stable when idle"
+
+    (git_repo / "app" / "util.py").write_text("VALUE = 99", encoding="utf-8")
+    (git_repo / "new.py").write_text("print(1)", encoding="utf-8")
+    after = repo_tools.working_tree_state()
+
+    touched = {p for p, mark in after.items() if baseline.get(p) != mark}
+    assert touched == {"app/util.py", "new.py"}
+
+
+def test_working_tree_state_sees_a_staged_edit(git_repo):
+    """Staging a change must not make it invisible."""
+    (git_repo / "app" / "main.py").write_text("staged", encoding="utf-8")
+    subprocess.run(["git", "add", "app/main.py"], cwd=git_repo, check=True)
+    assert "app/main.py" in repo_tools.working_tree_state()
+
+
+def test_working_tree_state_falls_back_to_the_filesystem_without_git(repo):
+    """Real work happens in directories nobody ran git init in."""
+    state = repo_tools.working_tree_state()
+    assert state is not None
+    assert "app/main.py" in state
+
+    before = dict(state)
+    (repo / "app" / "main.py").write_text("edited", encoding="utf-8")
+    after = repo_tools.working_tree_state()
+    assert after["app/main.py"] != before["app/main.py"]
+
+
+def test_the_filesystem_fingerprint_ignores_test_artifacts(repo):
+    """Running the tests must not itself look like a change to the source."""
+    before = repo_tools.working_tree_state()
+    (repo / "__pycache__").mkdir()
+    (repo / "__pycache__" / "main.cpython-312.pyc").write_text("c", encoding="utf-8")
+    (repo / ".pytest_cache").mkdir()
+    (repo / ".pytest_cache" / "CACHEDIR.TAG").write_text("x", encoding="utf-8")
+    assert repo_tools.working_tree_state() == before
+
+
+def test_working_tree_state_is_none_when_nothing_can_answer(repo, monkeypatch):
+    """None, not {} -- a tool failure is not evidence of a clean tree."""
+
+    def unreadable(*a, **k):
+        raise OSError("the disk is on fire")
+
+    monkeypatch.setattr(Workspace, "iter_files", unreadable)
+    assert repo_tools.working_tree_state() is None
+
+
+def test_git_status_is_confined_to_the_workspace(git_repo, monkeypatch):
+    """A workspace inside a bigger repository must not see the rest of it."""
+    (git_repo / "outside.py").write_text("x = 1", encoding="utf-8")
+    (git_repo / "app" / "inside.py").write_text("y = 2", encoding="utf-8")
+
+    _narrow_to(monkeypatch, git_repo / "app")
+    paths = {c["path"] for c in repo_tools.git_status()["changes"]}
+    assert paths == {"inside.py"}, paths
+
+
+def test_a_confined_git_diff_cannot_read_out_the_parent_project(git_repo, monkeypatch):
+    """git_diff would otherwise print files Workspace.resolve forbids reading."""
+    (git_repo / "app" / "util.py").write_text("SECRET_ABOVE = 1", encoding="utf-8")
+    (git_repo / "tests" / "test_main.py").write_text(
+        "SECRET_ASIDE = 2", encoding="utf-8"
+    )
+
+    _narrow_to(monkeypatch, git_repo / "tests")
+    diff = repo_tools.git_diff()["diff"]
+    assert "SECRET_ASIDE" in diff
+    assert "SECRET_ABOVE" not in diff
+
+
+def test_the_fingerprint_is_confined_to_the_workspace(git_repo, monkeypatch):
+    """Otherwise a run is credited with edits made where it cannot even read."""
+    (git_repo / "app" / "main.py").write_text("changed", encoding="utf-8")
+    (git_repo / "tests" / "test_main.py").write_text("changed too", encoding="utf-8")
+
+    _narrow_to(monkeypatch, git_repo / "tests")
+    assert set(repo_tools.working_tree_state()) == {"test_main.py"}

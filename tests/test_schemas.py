@@ -110,13 +110,26 @@ def test_approval_tolerates_low_severity_notes():
 # ----------------------------------------------------------------------- plan
 
 
-def make_task(task_id, deps=()):
+def make_task(task_id, deps=(), files=("app/thing.py",)):
     return Task(
         task_id=task_id,
         objective="o",
         validation_criteria="v",
         dependencies=list(deps),
+        files=list(files),
     )
+
+
+def test_plan_rejects_a_task_that_names_no_files():
+    """`files` is what the coder works from; empty, the task is only prose."""
+    with pytest.raises(ValidationError, match="names no files"):
+        ImplementationPlan(tasks=[make_task("T-1", files=())])
+
+
+def test_a_task_may_name_a_file_it_will_create():
+    """The path need not exist yet -- creating it is the task."""
+    plan = ImplementationPlan(tasks=[make_task("T-1", files=("README.md",))])
+    assert plan.tasks[0].files == ["README.md"]
 
 
 def test_plan_accepts_resolvable_dependencies():

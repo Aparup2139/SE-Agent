@@ -15,9 +15,10 @@ This endpoint starts an agent that **writes files and executes code**. Two
 controls bound that authority, both configured by environment variable:
 
 ``SE_AGENT_REPO_ROOT``
-    The only directory tree a request may target. Without it, the ``repo``
-    field is refused outright and every run uses the server's own working
-    directory -- a caller cannot point the agent at an arbitrary host path.
+    Confines the directory tree a request may target. Without it, a caller on
+    loopback -- the person who started the server, with the reach the CLI
+    already gives them -- may pick any directory on the machine, and a remote
+    caller may pick none at all.
 
 ``SE_AGENT_API_TOKEN``
     A bearer token required on every run request. Without it the server binds
@@ -44,7 +45,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from .agent import RunResult, preflight, stream_run
-from .telemetry import PHASE_LABELS, PHASE_ORDER, Update
+from .schemas import RunMode
+from .telemetry import PHASE_LABELS, Update, phase_order
 from .workflows.graph import DEFAULT_MAX_ITERATIONS, ITERATION_CEILING
 
 logger = logging.getLogger(__name__)
@@ -61,9 +63,8 @@ app = FastAPI(
 class RunRequest(BaseModel):
     request: str = Field(min_length=1, max_length=8000)
     repo: str | None = None
-    max_iterations: int = Field(
-        default=DEFAULT_MAX_ITERATIONS, ge=1, le=ITERATION_CEILING
-    )
+    max_iterations: int = Field(default=DEFAULT_MAX_ITERATIONS, ge=1, le=ITERATION_CEILING)
+    mode: RunMode = RunMode.THINKING
 
 
 def authorize(request: Request, authorization: str | None) -> str:
@@ -96,25 +97,40 @@ def authorize(request: Request, authorization: str | None) -> str:
     return f"local:{host or 'unknown'}"
 
 
-def resolve_repo(requested: str | None) -> str | None:
-    """Confine the target repository to the configured root.
+def is_local(request: Request) -> bool:
+    """Whether the caller is the machine's own user rather than the network."""
+    return ((request.client.host if request.client else "") or "") in LOOPBACK
 
-    Without ``SE_AGENT_REPO_ROOT`` a caller may not choose a directory at all:
-    an HTTP client picking an arbitrary host path for an agent that writes files
-    and runs commands is exactly the capability this must not hand out.
+
+def resolve_repo(requested: str | None, *, local: bool = False) -> str | None:
+    """Resolve the target repository, confined to the configured root if any.
+
+    A loopback caller is the person who started the server, and so may pick any
+    directory on the machine -- the same reach the CLI already has. A remote
+    caller may not: handing an arbitrary host path to an agent that writes files
+    and runs commands is exactly the capability this must not give the network,
+    so ``SE_AGENT_REPO_ROOT`` must be set and the path must live inside it.
     """
     if not requested:
         return None
 
     root = (os.environ.get("SE_AGENT_REPO_ROOT") or "").strip()
     if not root:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "choosing a repository over HTTP requires SE_AGENT_REPO_ROOT to "
-                "be set; without it the server only works in its own directory"
-            ),
-        )
+        if not local:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "choosing a repository from off this machine requires "
+                    "SE_AGENT_REPO_ROOT to be set"
+                ),
+            )
+        try:
+            target = Path(requested).expanduser().resolve()
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"unusable path: {exc}") from exc
+        if not target.is_dir():
+            raise HTTPException(status_code=400, detail="repository path is not a directory")
+        return str(target)
 
     try:
         allowed = Path(root).expanduser().resolve(strict=True)
@@ -124,9 +140,7 @@ def resolve_repo(requested: str | None) -> str | None:
         raise HTTPException(status_code=400, detail=f"unusable path: {exc}") from exc
 
     if target != allowed and allowed not in target.parents:
-        raise HTTPException(
-            status_code=403, detail="repository path is outside SE_AGENT_REPO_ROOT"
-        )
+        raise HTTPException(status_code=403, detail="repository path is outside SE_AGENT_REPO_ROOT")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="repository path is not a directory")
     return str(target)
@@ -144,13 +158,82 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/api/phases")
-async def phases() -> dict[str, Any]:
-    """The phase list, so a client can render the checklist before starting."""
+async def phases(mode: RunMode = RunMode.THINKING) -> dict[str, Any]:
+    """The phase list for one mode, so a client can render the checklist early.
+
+    The two modes have different checklists, so the client asks again when the
+    user switches rather than showing rows a normal run will never reach.
+    """
     return {
+        "mode": mode.value,
         "phases": [
-            {"id": phase.value, "label": PHASE_LABELS[phase]} for phase in PHASE_ORDER
-        ]
+            {"id": phase.value, "label": PHASE_LABELS[phase]}
+            for phase in phase_order(mode)
+        ],
     }
+
+
+@app.get("/api/dirs")
+async def dirs(
+    request: Request,
+    path: str | None = None,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """List the subdirectories of one directory, so a client can pick a repo.
+
+    Reach is ``resolve_repo``'s: the whole machine for a loopback caller,
+    nothing outside ``SE_AGENT_REPO_ROOT`` for anyone else. An empty ``path``
+    means the top -- the machine's drives, or the configured root.
+
+    ``entries`` are ready to navigate to as-is, and ``up`` is the parent or
+    null at the top, so a client never has to join paths itself.
+    """
+    authorize(request, authorization)
+    local = is_local(request)
+    confined = (os.environ.get("SE_AGENT_REPO_ROOT") or "").strip()
+
+    if not confined and not local:
+        raise HTTPException(
+            status_code=403,
+            detail="browsing this machine from off it requires SE_AGENT_REPO_ROOT",
+        )
+
+    if not path and not confined:
+        drives = getattr(os, "listdrives", lambda: ["/"])()
+        return {"path": "", "up": None, "entries": _entries(drives)}
+
+    target = Path(resolve_repo(path or ".", local=local))
+    if confined:
+        top = Path(confined).expanduser().resolve()
+        # "" would mean the drive list, which the confined caller may not see.
+        up = None if target == top else str(target.parent)
+    else:
+        up = "" if target == target.parent else str(target.parent)
+    return {
+        "path": str(target),
+        "up": up,
+        "entries": _entries(_subdirectories(target)),
+    }
+
+
+def _subdirectories(target: Path) -> list[str]:
+    """Immediate subdirectories, skipping dotted and unreadable ones."""
+    found = []
+    try:
+        children = list(target.iterdir())
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"unreadable: {exc}") from exc
+    for child in children:
+        try:
+            if child.is_dir() and not child.name.startswith("."):
+                found.append(str(child))
+        except OSError:  # a path we may not stat is not a path we can offer
+            continue
+    return sorted(found, key=str.casefold)
+
+
+def _entries(paths: list[str]) -> list[dict[str, str]]:
+    return [{"value": p, "label": Path(p).name or p} for p in paths]
 
 
 @app.post("/api/run")
@@ -169,7 +252,7 @@ async def run(
     200 response body.
     """
     identity = authorize(request, authorization)
-    repo = resolve_repo(body.repo)
+    repo = resolve_repo(body.repo, local=is_local(request))
 
     async def events():
         problems = preflight(repo)
@@ -179,7 +262,11 @@ async def run(
 
         try:
             async for item in stream_run(
-                body.request, repo=repo, limit=body.max_iterations, user_id=identity
+                body.request,
+                repo=repo,
+                limit=body.max_iterations,
+                mode=body.mode,
+                user_id=identity,
             ):
                 if isinstance(item, RunResult):
                     report = item.report
@@ -187,8 +274,15 @@ async def run(
                         "result",
                         {
                             "session_id": item.session_id,
+                            "mode": item.mode.value,
                             "succeeded": item.succeeded,
                             "tests_passed": item.tests_passed,
+                            "tests_inconclusive": bool(
+                                item.state.get("tests_inconclusive")
+                            ),
+                            "no_change_needed": bool(
+                                item.state.get("no_change_needed")
+                            ),
                             "review_approved": item.review_approved,
                             "iterations": item.state.get("iteration", 0),
                             "tool_calls": item.tracker.tool_calls,

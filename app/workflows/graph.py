@@ -48,13 +48,13 @@ from google.adk.workflow import START, Edge, JoinNode, Workflow, node
 from ..agents.architecture import build_architecture_agent
 from ..agents.coordinator import build_coordinator_agent, build_report_agent
 from ..agents.debugger import build_debugger_agent
-from ..agents.planner import build_planner_agent
+from ..agents.planner import build_direct_planner_agent, build_planner_agent
 from ..agents.repository import build_repository_agent
 from ..agents.requirements import build_requirements_agent
 from ..agents.reviewer import build_reviewer_agent
 from ..agents.risk import build_risk_agent
 from ..agents.tester import TesterAgent
-from ..schemas import ChangeScope, CodeReview
+from ..schemas import ChangeScope, CodeReview, RunMode
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +70,10 @@ ROUTE_FAILED = "failed"
 ROUTE_APPROVED = "approved"
 ROUTE_MINOR = "minor"
 ROUTE_MAJOR = "major"
+
+# The sandbox's wording for pytest's exit code 5. A project with no suite is a
+# normal thing to be asked to work in; a feature with no test is not.
+_NO_TESTS = "no tests were collected"
 
 
 def max_iterations() -> int:
@@ -119,19 +123,61 @@ def read_review(state) -> CodeReview | None:
         return None
 
 
-def _changed_files() -> list[str]:
-    """Files modified in the target repository, via git.
+def _is_normal(state) -> bool:
+    """True on the direct path. Absent mode means the full graph, as before."""
+    return state.get("mode") == RunMode.NORMAL.value
 
-    Returns an empty list when the repository is clean *or* when git cannot
-    answer. A tool failure must not be mistaken for evidence of a change.
+
+def _changes_expected(state) -> bool:
+    """Whether the plan said, before implementing, that files should change.
+
+    This is the one thing the repository cannot tell you. "Green tests, nothing
+    changed" is the signature of a run that silently did nothing *and* of a
+    request that was already satisfied -- the code is identical either way, so
+    no amount of inspection separates them. Only the request does, and the
+    planner is the stage that reads the request.
+
+    Declared up front, so it is a pre-commitment rather than an excuse: a plan
+    cannot decide after a failed implementation that no change was needed.
+    Absent or unreadable means expected, which keeps the guard on by default.
     """
-    from ..tools.repo_tools import git_status
+    plan = state.get("plan")
+    if isinstance(plan, dict):
+        return bool(plan.get("changes_expected", True))
+    return getattr(plan, "changes_expected", True)
 
-    result = git_status()
-    if not result.get("ok"):
-        logger.warning("could not read git status: %s", result.get("error"))
+
+def _tree_state() -> dict[str, str] | None:
+    """Fingerprint the workspace's uncommitted changes, or ``None`` if it cannot."""
+    from ..tools.repo_tools import working_tree_state
+
+    state = working_tree_state()
+    if state is None:
+        logger.warning("could not read the working tree state")
+    return state
+
+
+def _changed_files(state) -> list[str]:
+    """Files this run changed, measured against the tree it started from.
+
+    A dirty working tree is the normal case: the developer has uncommitted work
+    of their own. Comparing against the run's own baseline is what separates
+    "the agent edited this" from "this was already modified when we arrived" --
+    checking merely whether the tree is dirty would call every ambient edit a
+    result of the run, and would never fire the no-op guard at all.
+
+    Returns an empty list when nothing can answer. A tool failure must not be
+    mistaken for evidence of a change.
+    """
+    current = _tree_state()
+    if current is None:
         return []
-    return [change["path"] for change in result.get("changes", [])]
+    baseline = state.get("baseline_tree")
+    if baseline is None:
+        # No baseline: the fingerprint failed at run start but works now. Fall
+        # back to "anything dirty counts" -- weaker, but never blocks a change.
+        baseline = {}
+    return sorted(path for path, mark in current.items() if baseline.get(path) != mark)
 
 
 # ------------------------------------------------------------- routing nodes
@@ -150,6 +196,11 @@ async def decide_iteration(ctx: Context) -> str:
 
     if iteration > limit:
         ctx.state["iterations_exhausted"] = True
+        # Record what the run changed before handing over to the report. This is
+        # the *other* way into the reporter, and without this it arrives with no
+        # changed-file list at all -- then reports "nothing was changed" about
+        # work that is sitting on disk, which is worse than reporting nothing.
+        ctx.state["files_changed"] = _changed_files(ctx.state)
         ctx.route = ROUTE_EXHAUSTED
         return (
             f"Iteration budget exhausted ({limit} iterations). Reporting on the "
@@ -167,21 +218,44 @@ async def decide_after_tests(ctx: Context) -> str:
     the only thing consulted here -- no model gets a say in whether the tests
     passed.
 
-    A green suite is necessary but not sufficient. If the working tree is
-    unchanged, the suite that passed is the one that was already passing before
-    the run started, which says nothing about the requested feature. That
-    happens whenever the implementation step fails -- a provider error, an
-    exhausted rate limit -- and without this check an untouched repository would
-    sail through to review on the strength of its pre-existing tests.
+    A green suite is necessary but not sufficient. If this run changed no files,
+    the suite that passed is the one that was already passing before the run
+    started, which says nothing about the requested feature. That happens
+    whenever the implementation step fails -- a provider error, an exhausted
+    rate limit -- and without this check an untouched repository would sail
+    through to review on the strength of its pre-existing tests.
+
+    Measured against the baseline captured by :func:`initial_state`, not against
+    a clean tree, so the guard still fires on a repository that already had
+    uncommitted work in it. The exception is a plan that declared up front that
+    no change was needed: a request already satisfied is answered, not failed.
+
+    In ``RunMode.NORMAL`` a suite that collected nothing is not a failure. A
+    green suite is the evidence a *feature* needs, but the direct path is also
+    used for work no test covers -- writing a document, renaming a file -- and
+    there the demand for a passing test is one the task cannot meet. The
+    changed-file check still holds, so a run that did nothing still fails.
     """
     if ctx.state.get("tests_passed"):
-        changed = _changed_files()
-        if not changed:
+        changed = _changed_files(ctx.state)
+        if not changed and _changes_expected(ctx.state):
             ctx.route = ROUTE_FAILED
             return (
-                "Tests passed, but the working tree is unchanged -- nothing was "
+                "Tests passed, but this run changed no files -- nothing was "
                 "implemented, so these are the pre-existing tests. Treating this "
                 "as a failed iteration."
+            )
+        if not changed:
+            # The plan said before implementing that no change was required, and
+            # the suite it named is green. That is the request answered, not a
+            # run that did nothing -- and because the declaration was made up
+            # front it cannot be an excuse invented after failing.
+            ctx.state["files_changed"] = []
+            ctx.state["no_change_needed"] = True
+            ctx.route = ROUTE_PASSED
+            return (
+                "Tests pass and the plan expected no change: the repository is "
+                "already in the requested state. Nothing to implement."
             )
         ctx.state["files_changed"] = changed
         ctx.route = ROUTE_PASSED
@@ -191,9 +265,36 @@ async def decide_after_tests(ctx: Context) -> str:
         )
 
     tests = ctx.state.get("tests") or {}
-    if tests.get("execution_error"):
+    error = tests.get("execution_error") or ""
+
+    # "No tests collected" arrives as an execution error, because for a feature
+    # that is exactly what it is. On the direct path it is the ordinary state of
+    # a project with no suite, so it must be checked before the error branch --
+    # otherwise the leniency below can never be reached.
+    collected_nothing = not tests.get("test_count") and (
+        not error or _NO_TESTS in error
+    )
+
+    if error and not (_is_normal(ctx.state) and collected_nothing):
         ctx.route = ROUTE_FAILED
-        return f"Tests could not run: {tests['execution_error']}. Diagnosing."
+        return f"Tests could not run: {error}. Diagnosing."
+
+    if _is_normal(ctx.state) and collected_nothing:
+        changed = _changed_files(ctx.state)
+        if not changed:
+            ctx.route = ROUTE_FAILED
+            return (
+                "No tests were collected and this run changed no files -- there "
+                "is no evidence anything was done. Treating this as a failed "
+                "iteration."
+            )
+        ctx.state["files_changed"] = changed
+        ctx.state["tests_inconclusive"] = True
+        ctx.route = ROUTE_PASSED
+        return (
+            f"{len(changed)} file(s) changed, but no tests were collected, so "
+            "nothing here is verified by a test. Reporting the change as it is."
+        )
 
     failed = tests.get("failed", 0)
     errors = tests.get("errors", 0)
@@ -252,8 +353,8 @@ review_gate = node(decide_after_review, name="review_gate")
 # -------------------------------------------------------------- graph builder
 
 
-def build_workflow() -> Workflow:
-    """Assemble the full SE-Agent graph.
+def build_workflow(mode: RunMode = RunMode.THINKING) -> Workflow:
+    """Assemble the SE-Agent graph for one run mode.
 
     A fresh set of agents is built per call: ADK gives an agent one parent, and
     the architect appears twice in this graph (once on the main path, once on
@@ -261,7 +362,14 @@ def build_workflow() -> Workflow:
 
     The iteration budget is not baked in here -- it lives in session state, seeded
     by :func:`initial_state`, so a resumed run keeps the budget it began with.
+
+    ``RunMode.NORMAL`` builds the direct path only, and builds *only* the agents
+    that path uses -- constructing the four unreachable analysis agents would
+    cost a model instance each for nothing.
     """
+    if mode is RunMode.NORMAL:
+        return _direct_workflow()
+
     requirements = node(build_requirements_agent(), name="requirements")
     repository = node(build_repository_agent(), name="repository")
     risk = node(build_risk_agent(), name="risk")
@@ -312,16 +420,71 @@ def build_workflow() -> Workflow:
     return workflow
 
 
-def initial_state(feature_request: str, limit: int | None = None) -> dict:
+def _direct_workflow() -> Workflow:
+    """The direct path: plan, implement, test, report.
+
+    It keeps the two things that make a result mean anything -- a real test run
+    and the changed-file check -- and drops the four analysis agents, which are
+    most of a run's model calls. What it gives up is the independent review.
+    """
+    direct_planner = node(build_direct_planner_agent(), name="planner")
+    implement = node(build_coordinator_agent(), name="implement")
+    test = node(TesterAgent(), name="test")
+    diagnose = node(build_debugger_agent(), name="diagnose")
+    report = node(build_report_agent(), name="report")
+
+    return Workflow(
+        name="se_agent_normal",
+        max_concurrency=max_concurrency(),
+        description=(
+            "Plans a request against the repository, implements it, runs the "
+            "project's real tests, and reports what changed."
+        ),
+        edges=[
+            # Plan first, even here. Without one the coordinator has nothing to
+            # converge on and spends its calls surveying the repository instead
+            # of changing it.
+            Edge(from_node=START, to_node=direct_planner),
+            # Then the iteration gate: the direct path still needs a bounded
+            # number of attempts, and that is the only place the bound is
+            # enforced. Retries re-enter here, not at the planner -- the plan is
+            # in history already and re-planning would cost a call to arrive at
+            # the same place.
+            Edge(from_node=direct_planner, to_node=iteration_gate),
+            Edge(from_node=iteration_gate, to_node=implement, route=ROUTE_CONTINUE),
+            Edge(from_node=iteration_gate, to_node=report, route=ROUTE_EXHAUSTED),
+            Edge(from_node=implement, to_node=test),
+            Edge(from_node=test, to_node=test_gate),
+            Edge(from_node=test_gate, to_node=diagnose, route=ROUTE_FAILED),
+            Edge(from_node=diagnose, to_node=iteration_gate),
+            # No reviewer on this path: the change goes straight to the report.
+            # Skipping review is the cost of skipping the pipeline.
+            Edge(from_node=test_gate, to_node=report, route=ROUTE_PASSED),
+        ],
+    )
+
+
+def initial_state(
+    feature_request: str,
+    limit: int | None = None,
+    mode: RunMode = RunMode.THINKING,
+) -> dict:
     """Seed session state for a run.
 
     The iteration budget is placed in state rather than baked into the graph so
-    that a resumed session keeps the budget it started with.
+    that a resumed session keeps the budget it started with. The working-tree
+    baseline is seeded here for the same reason: a resumed run must keep
+    measuring against the tree its *first* iteration saw.
     """
     return {
         "feature_request": feature_request,
         "iteration": 0,
         "max_iterations": limit if limit is not None else max_iterations(),
+        # The gates read this to know which guarantees apply to this run.
+        "mode": mode.value,
+        # Snapshot the tree before anything runs, so the no-op guard can tell
+        # this run's edits from work that was already uncommitted.
+        "baseline_tree": _tree_state(),
     }
 
 

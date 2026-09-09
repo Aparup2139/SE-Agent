@@ -1,18 +1,28 @@
 """Shared construction rules for SE-Agent's agents.
 
-Every agent in the system runs on Kimi K3. What differs between them is role,
-authority (which tools they hold), and the schema they must fill. Centralizing
-that here keeps the individual agent modules to their prompt and their contract.
+Every agent in the system runs on the same configured model. What differs
+between them is role, authority (which tools they hold), and the schema they
+must fill. Centralizing that here keeps the individual agent modules to their
+prompt and their contract.
 """
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Callable
+from typing import Any
+
 from google.adk.agents import LlmAgent
+from google.adk.agents.readonly_context import ReadonlyContext
+from google.adk.models.base_llm import BaseLlm
 
-from ..llm.config import DEFAULT_MODEL
+from ..llm.config import get_config
+from ..llm.gemini_model import build_gemini
 
-# The one model, named once. Agent modules import this rather than a literal.
-MODEL = DEFAULT_MODEL
+# None means "ask get_config() for the live model", so a provider switch
+# (SE_AGENT_LLM_PROVIDER) takes effect with no code change. Tests set this to
+# a stub model name to bypass the real provider entirely.
+MODEL: str | None = None
 
 # Prepended to every agent instruction. States the shared rules that hold
 # regardless of role -- most importantly, that claims must be grounded in tool
@@ -44,11 +54,28 @@ truncating arbitrarily.
 """
 
 
+def resolve_model(agent: str) -> str | BaseLlm:
+    """The model one agent runs on: a name ADK resolves, or an instance.
+
+    A name is enough for the OpenAI-compatible providers -- ADK's registry
+    matches it to ``KimiK3Llm``, and one model serves every agent. Gemini is
+    handed over as a configured instance instead: retries, schema fixes and
+    the per-agent model choice all have to be attached to something, and a
+    bare name would get ADK's untouched defaults.
+    """
+    if MODEL is not None:
+        return MODEL
+    config = get_config()
+    if config.provider != "gemini":
+        return config.model
+    return build_gemini(agent)
+
+
 def build_agent(
     *,
     name: str,
     description: str,
-    instruction: str,
+    instruction: str | Callable[[ReadonlyContext], str],
     tools: list | None = None,
     output_schema: type | None = None,
     output_key: str | None = None,
@@ -62,6 +89,9 @@ def build_agent(
         description: What this agent is for. Other agents read this when
             deciding whether to delegate, so it must be accurate.
         instruction: The role-specific prompt, appended to the shared preamble.
+            May be a callable taking ADK's ``ReadonlyContext``, for an agent
+            whose prompt must *carry* state -- the plan it has to execute, say --
+            rather than hope to find it in the conversation history.
         tools: The agent's authority. Omitted entirely for agents that should
             not touch the repository.
         output_schema: Pydantic model the agent must fill. ADK reconciles this
@@ -69,13 +99,25 @@ def build_agent(
         output_key: Session-state key the validated output is written to.
         sub_agents: Agents this one may delegate to.
     """
-    full_instruction = SHARED_PREAMBLE + "\n" + instruction
-    if output_schema is not None:
-        full_instruction += SCHEMA_DISCIPLINE
+    full_instruction: Any
+    if callable(instruction):
+        # ADK skips its own state templating for a provider, so the provider
+        # itself is responsible for everything the prompt needs to contain.
+        async def full_instruction(ctx: ReadonlyContext) -> str:
+            role = instruction(ctx)
+            if inspect.isawaitable(role):
+                role = await role
+            text = SHARED_PREAMBLE + "\n" + role
+            return text + SCHEMA_DISCIPLINE if output_schema is not None else text
+
+    else:
+        full_instruction = SHARED_PREAMBLE + "\n" + instruction
+        if output_schema is not None:
+            full_instruction += SCHEMA_DISCIPLINE
 
     return LlmAgent(
         name=name,
-        model=MODEL,
+        model=resolve_model(name),
         description=description,
         instruction=full_instruction,
         tools=tools or [],
