@@ -21,9 +21,6 @@ DEFAULT_OLLAMA_MODEL = "qwen3:4b"
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434/v1"
 
 # Gemini is reached through ADK's own native client, not the OpenAI-compatible
-# endpoint, so it needs no base URL here. 2.5 Flash is deliberately not the
-# default: Google refuses it to keys created after its retirement ("no longer
-# available to new users"), and names 3.6 Flash as the replacement.
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
 
 # Providers whose API is reached over the OpenAI-compatible client share one

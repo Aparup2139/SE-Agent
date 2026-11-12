@@ -82,7 +82,7 @@ def build_agent(
     sub_agents: list | None = None,
     **kwargs,
 ) -> LlmAgent:
-    """Create an ADK ``LlmAgent`` backed by Kimi K3.
+    """Create an ADK ``LlmAgent``.
 
     Args:
         name: Agent id, used in events and for delegation.

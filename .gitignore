@@ -33,3 +33,7 @@ Thumbs.db
 .vscode/
 .s -ExecutionPolicy RemoteSigned) ; (& cUsersAparup GhoshDesktopCadence_project.venvScriptsActivate.ps1)
 testenv/
+
+# Build outputs
+*.zip
+output/

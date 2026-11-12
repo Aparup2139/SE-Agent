@@ -1,0 +1,493 @@
+\documentclass[11pt,a4paper]{article}
+
+% -----------------------------------------------------------------------------
+% Packages
+% -----------------------------------------------------------------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+% -----------------------------------------------------------------------------
+% Document style
+% -----------------------------------------------------------------------------
+\definecolor{SEBlue}{HTML}{2F6BFF}
+\definecolor{SENavy}{HTML}{16324F}
+\definecolor{SETeal}{HTML}{168F7A}
+\definecolor{SEPurple}{HTML}{7455D9}
+\definecolor{SEOrange}{HTML}{E59A13}
+\definecolor{SEGray}{HTML}{486581}
+\definecolor{SELight}{HTML}{F4F7FA}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=SENavy,
+  urlcolor=SEBlue,
+  pdftitle={SE Agent: A Multi-Agent Coding System},
+  pdfauthor={SE Agent Project}
+}
+
+\titleformat{\section}
+  {\Large\bfseries\color{SENavy}}
+  {\thesection}{0.7em}{}
+\titleformat{\subsection}
+  {\large\bfseries\color{SETeal}}
+  {\thesubsection}{0.7em}{}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\textcolor{SEGray}{SE Agent}}
+\rhead{\textcolor{SEGray}{Multi-Agent Coding System}}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.65em}
+\setlist[itemize]{leftmargin=1.6em,itemsep=0.3em,topsep=0.3em}
+\setlist[enumerate]{leftmargin=1.8em,itemsep=0.4em,topsep=0.3em}
+\renewcommand{\arraystretch}{1.25}
+\graphicspath{{docs/figures/}}
+
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\systemfigure}[3]{%
+  \begin{figure}[H]
+    \centering
+    \IfFileExists{#1}{%
+      \includegraphics[width=\textwidth]{#1}%
+    }{%
+      \fbox{\parbox[c][4cm][c]{0.92\textwidth}{\centering
+        Figure not found. Upload \texttt{#1} with this document.}}%
+    }
+    \caption{#2}
+    \label{#3}
+  \end{figure}
+}
+
+\begin{document}
+
+% -----------------------------------------------------------------------------
+% Title
+% -----------------------------------------------------------------------------
+\begin{titlepage}
+  \centering
+  \vspace*{2.4cm}
+
+  {\color{SEBlue}\rule{0.82\textwidth}{2pt}}\\[1.2cm]
+  {\Huge\bfseries\color{SENavy} SE Agent:\\[0.25cm]
+  A Multi-Agent Coding System\par}
+
+  \vspace{0.8cm}
+  {\Large\color{SEGray}
+  Architecture, guardrails, sandboxing, and future direction\par}
+
+  \vspace{1.2cm}
+  {\color{SEBlue}\rule{0.82\textwidth}{2pt}}
+
+  \vfill
+  \begin{minipage}{0.76\textwidth}
+    \centering
+    \color{SEGray}
+    SE Agent turns a software request into a planned, implemented,
+    tested, and reviewed repository change. Specialized agents work
+    together under one controlled workflow.
+  \end{minipage}
+
+  \vfill
+  {\large\color{SENavy}Technical Documentation}
+\end{titlepage}
+
+\tableofcontents
+\clearpage
+
+% -----------------------------------------------------------------------------
+\section{Objective}
+% -----------------------------------------------------------------------------
+
+SE Agent is a multi-agent software engineering assistant. Its purpose is to
+complete coding tasks inside an existing repository.
+
+The system accepts a feature request in plain language. It studies the
+repository. It creates a plan. It edits the required files. It runs real
+tests. It can diagnose failures and try again.
+
+The main objectives are:
+
+\begin{itemize}
+  \item divide a large software task into clear engineering roles;
+  \item make changes that follow the structure of the target repository;
+  \item verify results with real commands instead of model opinion;
+  \item protect user files and credentials while tools are running;
+  \item provide a final report based on measured facts; and
+  \item keep each run bounded, observable, and reproducible.
+\end{itemize}
+
+SE Agent is not only a chat interface. It is an execution system. Its output
+is a repository change, a test result, and a clear account of what happened.
+
+% -----------------------------------------------------------------------------
+\section{Proposed Method and Architecture}
+% -----------------------------------------------------------------------------
+
+The system follows a staged workflow. Each stage has one focused role.
+Information is stored in a shared, typed workflow state. Later agents use the
+results of earlier agents.
+
+The platform has two run modes:
+
+\begin{itemize}
+  \item \textbf{Thinking mode} uses the full pipeline. It includes requirements,
+  repository analysis, risk analysis, architecture, planning, testing, and
+  independent review.
+  \item \textbf{Normal mode} uses a shorter path. It plans, implements, tests,
+  and reports. It is faster, but it does not include the independent review
+  stage.
+\end{itemize}
+
+\systemfigure
+  {docs/figures/system-architecture.png}
+  {Layered architecture of the SE Agent platform.}
+  {fig:system-architecture}
+
+\subsection{Individual Agents}
+
+Table~\ref{tab:agents} lists every agent role in the current codebase.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{0.23\textwidth}Y Y}
+\toprule
+\textbf{Agent} & \textbf{Main responsibility} & \textbf{Main output} \\
+\midrule
+Requirements Agent & Converts the request into clear needs, constraints, assumptions, and acceptance criteria. & Requirements specification \\
+
+Repository Agent & Studies the repository structure, important files, conventions, dependencies, and test command. & Repository analysis \\
+
+Risk Agent & Finds likely failures, security concerns, migrations, and regression risks. & Risk analysis \\
+
+Architecture Agent & Selects the implementation approach. It defines components, interfaces, files, trade-offs, and rejected alternatives. & Architecture decision \\
+
+Planner Agent & Converts the architecture into ordered tasks. It declares whether file changes are expected before implementation starts. & Implementation plan \\
+
+Direct Planner Agent & Creates a practical plan directly from the request and repository. It is used in Normal mode. & Direct implementation plan \\
+
+Coordinator Agent & Leads implementation. It receives the current request and plan. It can edit files, run commands, and ask specialists for help. & Repository changes \\
+
+Coder Agent & Provides a reusable implementation role with coding and test tools. The current main workflow gives these tools directly to the Coordinator. & Code changes and test attempts \\
+
+Debugger Agent & Reads failures, finds likely causes, and gives a focused repair direction. & Diagnosis \\
+
+Security Agent & Reviews relevant code for unsafe input handling, secret exposure, path problems, and other security risks. & Security findings \\
+
+Testing Specialist Agent & Suggests focused tests and ways to reproduce problems. It can run test commands. & Testing advice and evidence \\
+
+Tester Agent & Runs the selected test command inside the sandbox. It does not use an LLM. & Measured test report and raw log \\
+
+Reviewer Agent & Independently checks correctness, scope, requirements, quality, and test coverage. & Approval or requested changes \\
+
+Report Agent & Summarizes the completed work, test status, limitations, and follow-up actions. & Final narrative report \\
+\bottomrule
+\end{tabularx}
+\caption{Agent roles and outputs.}
+\label{tab:agents}
+\end{table}
+
+\subsection{Workflow Dataflow}
+
+The request enters through the command line or web interface. Preflight checks
+run before an AI model is called. The system then captures the initial state of
+the repository.
+
+Thinking mode performs detailed analysis. Repository and risk analysis run in
+parallel. Their results are joined before architecture and planning.
+
+Normal mode creates a direct plan. Both modes then enter the same bounded
+implementation loop. The Coordinator changes files. The Tester runs the real
+project test command. Failed tests return to the Debugger. A successful
+Thinking-mode run also passes through the Reviewer.
+
+\systemfigure
+  {docs/figures/runtime-dataflow.png}
+  {Runtime dataflow for Thinking and Normal modes.}
+  {fig:runtime-dataflow}
+
+The final report is reconciled with measured state. The requested task, changed
+files, test results, and iteration count come from the system. A model cannot
+replace these facts with unsupported claims.
+
+% -----------------------------------------------------------------------------
+\section{Guardrails}
+% -----------------------------------------------------------------------------
+
+Guardrails limit what agents can see, change, and report. They are applied at
+several layers.
+
+\subsection{Workspace Boundary}
+
+Every repository tool works relative to one workspace root. Paths are resolved
+before use. Parent traversal and symbolic-link escapes are rejected. An agent
+cannot use a normal file tool to reach outside the selected repository.
+
+Git commands are also scoped to the workspace. This matters when the selected
+workspace is a subdirectory of a larger Git repository.
+
+\subsection{Secret and File Protection}
+
+Direct file reads and writes reject known secret files. This includes
+environment files, key files, and certificate material. Binary files are also
+rejected from normal text reads.
+
+File reads, command output, directory listings, and search results have size
+limits. These limits reduce accidental context growth and denial-of-service
+risks.
+
+One limitation remains. The code search path should apply the same secret-file
+check as the direct read path. This improvement is listed in
+Section~\ref{sec:future}.
+
+\subsection{Role-Based Tool Access}
+
+Agents receive tools according to their role:
+
+\begin{itemize}
+  \item analysis and review agents mainly receive inspection tools;
+  \item the Coordinator and Coder receive write and execution tools;
+  \item the Tester executes one test command through the sandbox; and
+  \item specialist agents are called through the Coordinator.
+\end{itemize}
+
+This design reduces unnecessary write access. The current testing tool set
+still permits general commands. A stricter command allowlist would make the
+boundary stronger.
+
+\subsection{Typed Outputs}
+
+Agent outputs use Pydantic schemas. Text length, list size, numeric range, and
+allowed values are checked. Invalid structured output is rejected or retried.
+This keeps the shared state predictable.
+
+\subsection{Bounded Iteration}
+
+The workflow stores an iteration counter and a maximum iteration limit. Every
+retry passes through the iteration gate. The run ends when the limit is
+reached. This prevents an endless implementation and debugging loop.
+
+\subsection{Evidence-Based Completion}
+
+The system records the working tree before the run. It compares the final tree
+with this baseline. Pre-existing user changes are not counted as agent work.
+
+A request can be reported as an intentional no-op only when the Planner states
+in advance that no changes are expected and the tests pass. Otherwise, a green
+pre-existing test suite is not enough to claim success.
+
+Test status comes from a real process exit code. Review status comes from the
+review gate. Final report facts are replaced with measured values before they
+are returned to the user.
+
+\subsection{API Guardrails}
+
+The server can require a bearer token. Repository paths are validated before
+the event stream starts. Remote callers are restricted to the configured
+repository root. Loopback callers can use the local directory picker.
+
+% -----------------------------------------------------------------------------
+\section{Sandboxing}
+% -----------------------------------------------------------------------------
+
+Repository commands may execute generated or untrusted code. SE Agent therefore
+runs commands through \texttt{sandbox/local.sh}. The Python sandbox wrapper
+selects the strongest available isolation tier.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{0.16\textwidth}Y Y}
+\toprule
+\textbf{Tier} & \textbf{Isolation} & \textbf{Meaning} \\
+\midrule
+\texttt{bwrap} & Mount, network, process, and IPC namespaces. Most of the host filesystem is hidden. The workspace is the main writable path. & Strongest supported local boundary \\
+
+\texttt{unshare} & A user and network namespace. Network access is removed by default. The host filesystem is still visible. & Useful, but weaker filesystem protection \\
+
+\texttt{none} & Clean environment and controlled working directory only. & Not a security boundary; it must be explicitly allowed \\
+\bottomrule
+\end{tabularx}
+\caption{Sandbox isolation tiers.}
+\label{tab:sandbox-tiers}
+\end{table}
+
+The sandbox probes the host by running each mechanism. It does not only check
+whether a command exists. A mechanism that is installed but unusable is not
+selected.
+
+The main sandbox controls are:
+
+\begin{itemize}
+  \item commands start from an empty environment using \texttt{env -i};
+  \item only a small environment allowlist is forwarded;
+  \item model keys and other host secrets are not forwarded;
+  \item each run receives a private temporary directory and temporary home;
+  \item network access is disabled by default;
+  \item the file-size limit is 512 MB where the host supports it;
+  \item the process limit is 512 where the host supports it;
+  \item wall-clock timeouts stop long-running commands;
+  \item the Python wrapper kills the full process group after a timeout; and
+  \item exit code 97 identifies a sandbox failure, not a failed test suite.
+\end{itemize}
+
+On Linux, \texttt{bwrap} provides the strongest protection. On Windows, the
+system can enter WSL to use Linux namespaces. Without WSL, only the
+\texttt{none} tier may be available. Production use should require a real
+isolation tier.
+
+% -----------------------------------------------------------------------------
+\section{Technology Stack and AI Model Providers}
+% -----------------------------------------------------------------------------
+
+\subsection{Technology Stack}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{0.27\textwidth}Y}
+\toprule
+\textbf{Technology} & \textbf{Use in SE Agent} \\
+\midrule
+Python 3.11 or newer & Main implementation language \\
+Google Agent Development Kit 2.8 & Agent runtime, workflow graph, runner, events, tools, sessions, artifacts, and memory interfaces \\
+Pydantic 2 & Typed agent outputs and workflow state validation \\
+FastAPI & HTTP API, authentication checks, health endpoints, and run endpoint \\
+Server-Sent Events & Live progress messages from the server to the browser \\
+Uvicorn & ASGI application server \\
+HTML, CSS, and JavaScript & Local browser console \\
+HTTPX and Requests & Provider communication and HTTP handling \\
+Git & Change inspection, repository history, and scoped diffs \\
+Bash, Bubblewrap, Unshare, and WSL & Local command isolation \\
+Pytest and pytest-asyncio & Automated tests \\
+Ruff & Formatting-independent lint and code-quality checks \\
+\bottomrule
+\end{tabularx}
+\caption{Main technologies used by the platform.}
+\label{tab:tech-stack}
+\end{table}
+
+The default runtime services are in memory. Sessions, artifacts, and memory do
+not survive a process restart. This is suitable for local development. A
+persistent deployment needs external storage.
+
+\subsection{AI Model Providers}
+
+The provider is selected through configuration. The agent code does not need to
+change when the provider changes.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{L{0.18\textwidth}L{0.28\textwidth}Y}
+\toprule
+\textbf{Provider} & \textbf{Default model} & \textbf{Integration} \\
+\midrule
+NVIDIA NIM & \texttt{moonshotai/kimi-k3} & Uses the custom OpenAI-compatible adapter. This is the default provider. \\
+Ollama & \texttt{qwen3:4b} & Uses the same OpenAI-compatible path. It supports local, keyless model execution. \\
+Google Gemini & \texttt{gemini-3.6-flash} & Uses a native ADK Gemini adapter with schema cleanup, retries, model spreading, and quota-aware failover. \\
+\bottomrule
+\end{tabularx}
+\caption{Supported AI model providers and current defaults.}
+\label{tab:model-providers}
+\end{table}
+
+The OpenAI-compatible adapter also recovers structured tool calls when a weaker
+model returns JSON as plain text. Provider requests have retry and error
+handling. Gemini can distribute agents across a configured model list.
+
+% -----------------------------------------------------------------------------
+\section{Future Prospects and Improvements}
+\label{sec:future}
+% -----------------------------------------------------------------------------
+
+The present system is a strong local prototype. The following improvements
+would make it safer and more suitable for larger teams.
+
+\begin{enumerate}
+  \item \textbf{Use per-run workspaces.}
+  Remove process-global workspace state. Give every run its own immutable
+  repository context. This will prevent conflicts between concurrent requests.
+
+  \item \textbf{Add persistent storage.}
+  Store sessions, artifacts, test logs, and reports in a database and object
+  store. Runs could then be resumed after a restart.
+
+  \item \textbf{Strengthen secret protection.}
+  Apply the secret-file policy to code search and every inspection path. Add
+  secret scanning before prompts and before final output.
+
+  \item \textbf{Use content hashes for change evidence.}
+  Replace file-size and diff-count fingerprints with cryptographic content
+  hashes. This will detect equal-sized rewrites reliably.
+
+  \item \textbf{Tighten tool permissions.}
+  Remove unrestricted command execution from read-only specialists. Use command
+  categories, allowlists, and explicit approval for destructive operations.
+
+  \item \textbf{Improve cross-platform isolation.}
+  Add container or micro-VM execution. This would provide a consistent boundary
+  on Linux, Windows, and hosted systems.
+
+  \item \textbf{Make compaction provider-aware.}
+  Use the selected provider for context summarization. The current compactor is
+  tied to the OpenAI-compatible Kimi adapter.
+
+  \item \textbf{Expand test support.}
+  Parse detailed results from npm, Go, and Cargo. Add coverage measurement,
+  mutation testing, and changed-test selection.
+
+  \item \textbf{Add human approval gates.}
+  Ask for approval before dependency upgrades, migrations, deletions, network
+  access, or other high-impact changes.
+
+  \item \textbf{Improve observability.}
+  Record traces, token use, model cost, tool duration, retry reasons, and
+  sandbox resource use. This will make production failures easier to explain.
+
+  \item \textbf{Build a broader evaluation suite.}
+  Test the platform on many languages, repository sizes, bug types, security
+  tasks, and incomplete test suites. Compare quality, cost, and completion time
+  across modes and providers.
+\end{enumerate}
+
+% -----------------------------------------------------------------------------
+\section{Conclusion}
+% -----------------------------------------------------------------------------
+
+SE Agent separates software work into focused roles. One agent does not need to
+understand, plan, implement, test, and review everything alone. The workflow
+makes these responsibilities visible and controlled.
+
+The strongest parts of the design are its real test execution, typed state,
+bounded retry loops, measured final reports, and layered sandbox controls. The
+two run modes also provide a clear choice between speed and assurance.
+
+The system still needs stronger concurrency isolation, persistent services, and
+stricter tool permissions before broad multi-user deployment. These changes are
+practical extensions of the present architecture.
+
+SE Agent shows how multiple AI agents can work as a small software engineering
+team. It combines model reasoning with deterministic tools and verifiable
+evidence. This combination is the foundation for dependable automated coding.
+
+\end{document}

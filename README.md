@@ -1,7 +1,8 @@
 # SE-Agent
 
-A multi-agent software engineering assistant built on **Google ADK 2.8.0**, with
-**Kimi K3 on NVIDIA NIM** as its only model.
+A multi-agent software engineering assistant built on **Google ADK 2.8.0**.
+It supports **Kimi K3 on NVIDIA NIM**, **local models through Ollama**, and
+**Google Gemini**.
 
 Give it a feature request in plain language. It analyses the repository, designs
 the change, plans it, implements it, **runs the real tests in a sandbox**, reviews
@@ -39,9 +40,9 @@ Whatever the tier, the environment is an allowlist: `NVIDIA_API_KEY` and your
 host credentials are absent from what the tested code sees, rather than merely
 unmentioned.
 
-**Private reasoning stays private.** Kimi K3 returns its chain-of-thought in a
-separate field. It is dropped in the provider layer, never stored in state, and
-never surfaced in the UI.
+**Private reasoning stays private.** When a provider returns reasoning in a
+separate field, the provider layer drops it. It is never stored in state or
+surfaced in the UI.
 
 ---
 
@@ -51,7 +52,8 @@ never surfaced in the UI.
 - `bash` (Git Bash on Windows) -- runs the sandbox script
 - For a real isolation boundary: `bubblewrap` or `unshare` (Linux/WSL).
   See **The sandbox**; on Windows this means WSL.
-- An NVIDIA NIM API key from <https://build.nvidia.com/>
+- One configured model provider: an NVIDIA NIM key, a Google Gemini key, or a
+  running local Ollama server.
 
 ## Setup
 
@@ -63,14 +65,14 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-**2. Add your API key**
+**2. Configure a model provider**
 
 ```bash
-cp .env.example .env            # then edit it and set NVIDIA_API_KEY
+cp .env.example .env            # NVIDIA is the default; edit the provider settings
 ```
 
-`.env` is gitignored. The key is never logged, never included in an exception
-message, and never passed into the sandbox.
+`.env` is gitignored. Provider keys are never logged, included in exception
+messages, or passed into the sandbox. Ollama does not require an API key.
 
 For a substantially faster first run, also set `NVIDIA_REASONING_EFFORT=low`.
 

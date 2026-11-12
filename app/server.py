@@ -9,24 +9,6 @@ Run it with::
 
     uvicorn app.server:app --reload
 
-Security
---------
-This endpoint starts an agent that **writes files and executes code**. Two
-controls bound that authority, both configured by environment variable:
-
-``SE_AGENT_REPO_ROOT``
-    Confines the directory tree a request may target. Without it, a caller on
-    loopback -- the person who started the server, with the reach the CLI
-    already gives them -- may pick any directory on the machine, and a remote
-    caller may pick none at all.
-
-``SE_AGENT_API_TOKEN``
-    A bearer token required on every run request. Without it the server binds
-    to localhost only by convention and refuses to accept a token-free request
-    from a non-loopback client.
-
-Neither default is "open": an unconfigured server is usable locally and
-inert to anyone else.
 """
 
 from __future__ import annotations

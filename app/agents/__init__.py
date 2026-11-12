@@ -1,4 +1,4 @@
-"""SE-Agent's agents. Every one of them runs on Kimi K3 via NVIDIA NIM.
+"""SE-Agent's agents. 
 
 The only exception is :class:`~app.agents.tester.TesterAgent`, which has no
 model at all -- test results must come from a process, never from a prediction.

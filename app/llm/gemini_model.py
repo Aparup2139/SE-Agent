@@ -39,8 +39,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-# Long enough to outlast a free-tier minute window, capped so a wedged
-# quota fails the run instead of hanging it for an hour.
+
 RETRY_OPTIONS = types.HttpRetryOptions(
     attempts=6,
     initial_delay=2.0,
@@ -48,31 +47,13 @@ RETRY_OPTIONS = types.HttpRetryOptions(
     http_status_codes=[408, 429, 500, 502, 503, 504],
 )
 
-# Same policy without 429: when several models are configured, a spent
-# quota is answered by failing over rather than waiting (see build_gemini).
+
 RETRY_OPTIONS_NO_429 = RETRY_OPTIONS.model_copy(
     update={"http_status_codes": [408, 500, 502, 503, 504]}
 )
 
-# genai's own retry predicate only covers HTTP statuses and *httpx* transport
-# errors, but ADK's async path runs on aiohttp -- so a DNS hiccup
-# (ClientConnectorDNSError, an OSError) is not retried at all and ends the
-# run. Observed mid-run against generativelanguage.googleapis.com.
-TRANSPORT_ATTEMPTS = 4
 
-# The free tier enforces at least two different 429s, and they call for
-# opposite responses:
-#
-# ``...RequestsPerDayPerProjectPerModel-FreeTier``  (observed quotaValue 20)
-#     Genuinely spent for the day. Waiting cannot help; move to another model.
-# ``...InputTokensPerModelPerMinute-FreeTier``
-#     A per-minute token window that refills in seconds. Blacklisting a model
-#     for this is what turned a healthy new project into "every configured
-#     Gemini model is out of quota" within a minute -- several agents run in
-#     parallel, so one burst trips it and the failover ate the whole list.
-#
-# So the quota id decides: fail over only for a daily cap, and otherwise wait
-# out the window the server names in RetryInfo.
+TRANSPORT_ATTEMPTS = 4
 _PER_DAY_MARKER = "PerDay"
 _RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*:\s*['\"]?(\d+(?:\.\d+)?)s")
 
@@ -114,13 +95,6 @@ _EXHAUSTED: set[str] = set()
 
 
 def _candidates() -> tuple[str, ...]:
-    """The models this run may use, in preference order.
-
-    ``GEMINI_MODEL`` pins one -- right for a paid key, and for reproducing a
-    single agent's behaviour -- while ``GEMINI_MODELS`` overrides the list.
-    Read from the environment on every call, not cached, so editing ``.env``
-    is enough to change models with no code change.
-    """
     pinned = (os.environ.get("GEMINI_MODEL") or "").strip()
     if pinned:
         return (pinned,)
@@ -131,13 +105,7 @@ def _candidates() -> tuple[str, ...]:
 
 
 def project_label() -> str:
-    """Which Google Cloud project this key spends, for the log and errors.
 
-    The Gemini Developer API takes the project from the key itself, so these
-    are identification only -- they are not sent anywhere. Quota is counted
-    per project, though, so naming it is what makes "out of quota" legible
-    when several keys are in play: it says *whose* quota ran out.
-    """
     name = (os.environ.get("GEMINI_PROJECT") or "").strip()
     number = (os.environ.get("GEMINI_PROJECT_NUMBER") or "").strip()
     if name and number and number not in name:
@@ -232,8 +200,6 @@ class SEAgentGemini(Gemini):
                     produced = True
                     yield response
                 return
-            # Neither branch may retry a turn that already emitted something:
-            # the caller has consumed it, and replaying would duplicate it.
             except (TimeoutError, OSError) as exc:
                 transport_left -= 1
                 if produced or transport_left <= 0:
@@ -252,9 +218,6 @@ class SEAgentGemini(Gemini):
                 spent_for_the_day, retry_after = _quota_verdict(exc)
 
                 if not spent_for_the_day and minute_waits_left > 0:
-                    # A per-minute window: this model is fine in a moment, and
-                    # moving off it would burn a second model's quota for
-                    # nothing. The server names the wait; trust it, bounded.
                     minute_waits_left -= 1
                     wait = min(max(retry_after, 2.0), MAX_MINUTE_WAIT)
                     logger.warning(
@@ -305,9 +268,5 @@ def build_gemini(agent: str) -> SEAgentGemini:
     """The Gemini model one named agent runs on."""
     model = model_for(agent)
     logger.info("agent %s runs on %s (%s)", agent, model, project_label())
-    # 429 is handled here rather than by the HTTP retry, which cannot tell a
-    # daily cap from a per-minute window: one needs another model, the other
-    # needs a pause. A pinned single model has nowhere to fail over to, so
-    # there the HTTP layer's wait-and-retry is kept as well.
     retry = RETRY_OPTIONS if len(_candidates()) == 1 else RETRY_OPTIONS_NO_429
     return SEAgentGemini(model=model, retry_options=retry)

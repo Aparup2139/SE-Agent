@@ -346,3 +346,19 @@ def test_dirs_refuses_to_list_the_machine_from_off_it(monkeypatch):
     remote = TestClient(server.app, client=("203.0.113.9", 40000))
     response = remote.get("/api/dirs", headers={"Authorization": "Bearer correct-token"})
     assert response.status_code == 403
+
+
+def test_the_console_declares_its_own_icon():
+    """Otherwise the browser probes /favicon.ico, which has no route.
+
+    The icon is inline rather than a served file: this app exposes only "/"
+    and /api/*, so a static asset would need a route and a mount for one
+    16x16 image.
+    """
+    html = server.CONSOLE.read_text(encoding="utf-8")
+    marker = 'rel="icon" href="data:image/svg+xml,'
+    assert marker in html
+    encoded = html.split(marker, 1)[1].split('"', 1)[0]
+    # A raw '#' ends the URL at the fragment, truncating the icon silently.
+    assert "#" not in encoded
+    assert "%3Csvg" in encoded and "%3C/svg%3E" in encoded
